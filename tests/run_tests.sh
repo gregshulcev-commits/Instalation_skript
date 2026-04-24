@@ -28,9 +28,14 @@ EOF_MAKE
     mkdir -p "$dst/fake-tools/amneziawg-tools-master/src"
     cat > "$dst/fake-tools/amneziawg-tools-master/src/Makefile" <<'EOF_TMAKE'
 all:
-	@echo fake-tools
+	@echo fake-tools-build
+clean:
+	@echo fake-tools-clean
 install:
-	@echo fake-tools-install
+	mkdir -p "$(PREFIX)/bin"
+	printf '#!/usr/bin/env bash\necho FAKE-AWG\n' > "$(PREFIX)/bin/awg"
+	printf '#!/usr/bin/env bash\necho FAKE-AWG-QUICK "$$@"\n' > "$(PREFIX)/bin/awg-quick"
+	chmod +x "$(PREFIX)/bin/awg" "$(PREFIX)/bin/awg-quick"
 EOF_TMAKE
     tar -czf "$dst/amneziawg-tools-master.tar.gz" -C "$dst/fake-tools" amneziawg-tools-master
 }
@@ -118,6 +123,20 @@ echo "sysctl $*" >> "${TEST_LOG_DIR}/sysctl.log"
 exit 0
 EOF_SYSCTL
 
+    cat > "$bin_dir/dkms" <<'EOF_DKMS_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "dkms $*" >> "${TEST_LOG_DIR}/dkms.log"
+exit 0
+EOF_DKMS_STUB
+
+    cat > "$bin_dir/modprobe" <<'EOF_MODPROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "modprobe $*" >> "${TEST_LOG_DIR}/modprobe.log"
+exit 0
+EOF_MODPROBE
+
     chmod +x "$bin_dir"/*
 }
 
@@ -138,6 +157,7 @@ run_in_env() {
         SYSTEMD_DIR="${SYSTEMD_DIR}" \
         CACHE_DIR="${CACHE_DIR}" \
         INSTALL_PREFIX="${INSTALL_PREFIX}" \
+        DKMS_ROOT="${DKMS_ROOT}" \
         FORCE_OFFLINE=yes \
         SKIP_PACKAGE_INSTALL=yes \
         SKIP_BUILD=yes \
@@ -159,6 +179,7 @@ NFTABLES_CONF="${TMP_ROOT}/etc/nftables.conf"
 SYSTEMD_DIR="${TMP_ROOT}/etc/systemd/system"
 CACHE_DIR="${TMP_ROOT}/cache"
 INSTALL_PREFIX="${TMP_ROOT}/usr/local"
+DKMS_ROOT="${TMP_ROOT}/usr/src"
 STUB_BIN="${TMP_ROOT}/bin"
 TEST_LOG_DIR="${TMP_ROOT}/logs"
 prepare_fake_sources "$SOURCES_DIR"
@@ -172,12 +193,41 @@ done
 bash -n "${BUNDLE_ROOT}/install.sh" || fail "Синтаксическая ошибка: install.sh"
 pass "Все bash-скрипты проходят bash -n"
 
-step "Тест 01_install_from_source.sh"
+step "Тест 01_install_from_source.sh append-only sysctl"
+mkdir -p "$(dirname "$SYSCTL_FILE")"
+printf '# old sysctl marker\nnet.ipv4.ip_forward = 0\n' > "$SYSCTL_FILE"
 run_in_env "${BUNDLE_ROOT}/scripts/01_install_from_source.sh"
 [[ -f "$INSTALL_STATE_FILE" ]] || fail "install.env не создан"
 [[ -f "$SYSCTL_FILE" ]] || fail "00-amnezia.conf не создан"
-grep -q 'net.ipv4.ip_forward = 1' "$SYSCTL_FILE" || fail "В sysctl не записан net.ipv4.ip_forward = 1"
-pass "01_install_from_source.sh создаёт install.env и sysctl файл"
+grep -q '^# old sysctl marker$' "$SYSCTL_FILE" || fail "Старая sysctl строка-маркер потеряна"
+grep -q '^net.ipv4.ip_forward = 0$' "$SYSCTL_FILE" || fail "Старое sysctl значение было изменено"
+grep -q '^net.ipv4.ip_forward = 1$' "$SYSCTL_FILE" || fail "Новое sysctl значение не дописано"
+pass "01_install_from_source.sh дописывает sysctl/install.env без изменения старых строк"
+
+step "Тест safe-prefix установки awg-tools без перезаписи старых бинарников"
+SAFE_ROOT="${TMP_ROOT}/safe-tools-install"
+SAFE_SOURCES_DIR="${SAFE_ROOT}/sources"
+SAFE_STATE_DIR="${SAFE_ROOT}/etc/amnezia/amneziawg"
+SAFE_INSTALL_STATE_FILE="${SAFE_STATE_DIR}/install.env"
+SAFE_SYSCTL_FILE="${SAFE_ROOT}/etc/sysctl.d/00-amnezia.conf"
+SAFE_CACHE_DIR="${SAFE_ROOT}/cache"
+SAFE_INSTALL_PREFIX="${SAFE_ROOT}/usr/local"
+SAFE_DKMS_ROOT="${SAFE_ROOT}/usr/src"
+SAFE_STUB_BIN="${SAFE_ROOT}/bin"
+SAFE_LOG_DIR="${SAFE_ROOT}/logs"
+prepare_fake_sources "$SAFE_SOURCES_DIR"
+prepare_stubs "$SAFE_STUB_BIN" "$SAFE_LOG_DIR"
+mkdir -p "${SAFE_INSTALL_PREFIX}/bin"
+printf 'OLD-AWG\n' > "${SAFE_INSTALL_PREFIX}/bin/awg"
+printf 'OLD-AWG-QUICK\n' > "${SAFE_INSTALL_PREFIX}/bin/awg-quick"
+chmod +x "${SAFE_INSTALL_PREFIX}/bin/awg" "${SAFE_INSTALL_PREFIX}/bin/awg-quick"
+env     PATH="${SAFE_STUB_BIN}:$PATH"     TEST_LOG_DIR="${SAFE_LOG_DIR}"     AMNEZIA_BUNDLE_ROOT="${BUNDLE_ROOT}"     SOURCES_DIR="${SAFE_SOURCES_DIR}"     STATE_DIR="${SAFE_STATE_DIR}"     INSTALL_STATE_FILE="${SAFE_INSTALL_STATE_FILE}"     SYSCTL_FILE="${SAFE_SYSCTL_FILE}"     CACHE_DIR="${SAFE_CACHE_DIR}"     INSTALL_PREFIX="${SAFE_INSTALL_PREFIX}"     DKMS_ROOT="${SAFE_DKMS_ROOT}"     FORCE_OFFLINE=yes     SKIP_PACKAGE_INSTALL=yes     SKIP_MODPROBE=yes     "${BUNDLE_ROOT}/scripts/01_install_from_source.sh"
+grep -qx '^OLD-AWG$' "${SAFE_INSTALL_PREFIX}/bin/awg" || fail "Старый awg бинарник был изменён"
+grep -qx '^OLD-AWG-QUICK$' "${SAFE_INSTALL_PREFIX}/bin/awg-quick" || fail "Старый awg-quick бинарник был изменён"
+grep -q "AWG_BIN='${SAFE_INSTALL_PREFIX}/libexec/amneziawg-bundle-tools/bin/awg'" "$SAFE_INSTALL_STATE_FILE" || fail "install.env не указывает на новый safe-prefix awg"
+grep -q "AWG_QUICK_BIN='${SAFE_INSTALL_PREFIX}/libexec/amneziawg-bundle-tools/bin/awg-quick'" "$SAFE_INSTALL_STATE_FILE" || fail "install.env не указывает на новый safe-prefix awg-quick"
+"${SAFE_INSTALL_PREFIX}/libexec/amneziawg-bundle-tools/bin/awg" | grep -q FAKE-AWG || fail "Новый awg не установлен в safe-prefix"
+pass "01_install_from_source.sh ставит awg-tools в новый каталог и не меняет старые бинарники"
 
 step "Тест 02_create_server_config.sh для awg0"
 printf '\n\n\n\n89.124.86.140\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | run_in_env "${BUNDLE_ROOT}/scripts/02_create_server_config.sh"
@@ -195,7 +245,7 @@ pass "02_create_server_config.sh создаёт awg0.conf и manager env"
 step "Тест 03_setup_nftables.sh"
 printf '\n\nY\n' | run_in_env "${BUNDLE_ROOT}/scripts/03_setup_nftables.sh"
 [[ -f "$NFTABLES_CONF" ]] || fail "nftables.conf не создан"
-grep -q 'udp dport { 56789 }' "$NFTABLES_CONF" || fail "В nftables.conf нет правила VPN порта"
+grep -q 'elements = { 56789 }' "$NFTABLES_CONF" || fail "В nftables.conf нет VPN порта в append-safe set"
 grep -q 'tcp dport 22' "$NFTABLES_CONF" || fail "В nftables.conf нет правила SSH"
 grep -q 'masquerade' "$NFTABLES_CONF" || fail "В nftables.conf нет masquerade"
 [[ -f "$FIREWALL_ENV_FILE" ]] || fail "firewall.env не создан"
@@ -211,6 +261,17 @@ grep -q '^MTU = 1280$' "$CLIENT_CONF" || fail "В client.conf нет MTU кли�
 grep -q '^### Client owner_phone$' "$SERVER_CONF" || fail "В server.conf не добавлен peer клиента"
 grep -q '^AllowedIPs = 10.8.1.2/32$' "$SERVER_CONF" || fail "В peer клиента нет IPv4-only AllowedIPs"
 pass "04_add_client.sh дописывает peer и создаёт client.conf"
+
+step "Тест запрета перезаписи существующего интерфейса"
+SERVER_BEFORE="${TMP_ROOT}/awg0.before"
+cp "$SERVER_CONF" "$SERVER_BEFORE"
+if printf '\n\n\n\n89.124.86.140\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | \
+    VPN_IF_DEFAULT=awg0 OVERWRITE_EXISTING_IFACE=yes \
+    run_in_env "${BUNDLE_ROOT}/scripts/02_create_server_config.sh" >/tmp/overwrite-attempt.log 2>&1; then
+    fail "02_create_server_config.sh разрешил перезапись существующего awg0"
+fi
+cmp -s "$SERVER_CONF" "$SERVER_BEFORE" || fail "server.conf awg0 изменился после отказанной перезаписи"
+pass "02_create_server_config.sh не перезаписывает существующий интерфейс даже при OVERWRITE_EXISTING_IFACE=yes"
 
 step "Тест создания второго интерфейса awg1"
 printf '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | \
@@ -228,10 +289,16 @@ grep -q "DEFAULT_CLIENT_MTU='1200'" "${STATE_DIR}/manager-awg1.env" || fail "awg
 [[ -d "${STATE_DIR}/awg1/clients" ]] || fail "awg1 clients dir не создан"
 pass "Второй интерфейс создаётся рядом с первым"
 
-step "Тест nftables для двух интерфейсов"
+step "Тест nftables для двух интерфейсов append-only"
+NFT_BEFORE="${TMP_ROOT}/nftables.before"
+cp "$NFTABLES_CONF" "$NFT_BEFORE"
+NFT_BEFORE_SIZE="$(wc -c < "$NFT_BEFORE" | tr -d ' ')"
 printf '\n\nY\n' | run_in_env "${BUNDLE_ROOT}/scripts/03_setup_nftables.sh"
-grep -q 'udp dport { 56789, 443 }' "$NFTABLES_CONF" || fail "nftables не содержит оба UDP порта"
-grep -q 'iifname { "awg0", "awg1" } accept' "$NFTABLES_CONF" || fail "nftables не содержит оба интерфейса"
+head -c "$NFT_BEFORE_SIZE" "$NFTABLES_CONF" > "${TMP_ROOT}/nftables.prefix"
+cmp -s "$NFT_BEFORE" "${TMP_ROOT}/nftables.prefix" || fail "nftables.conf был изменён не append-only способом"
+grep -q 'elements = { 56789 }' "$NFTABLES_CONF" || fail "nftables потерял исходный UDP порт awg0"
+grep -q 'add element ip amneziawg_bundle vpn_ports { 443 }' "$NFTABLES_CONF" || fail "nftables не содержит append-команду для UDP порта awg1"
+grep -q 'add element ip amneziawg_bundle vpn_ifaces { "awg1" }' "$NFTABLES_CONF" || fail "nftables не содержит append-команду для awg1"
 pass "03_setup_nftables.sh учитывает несколько интерфейсов"
 
 step "Тест добавления клиента на awg1"
@@ -243,9 +310,12 @@ grep -q '^MTU = 1200$' "$CLIENT_CONF_2" || fail "Клиент awg1 не испо
 grep -q '^AllowedIPs = 10.8.2.2/32$' "$SERVER_CONF_2" || fail "Peer awg1 не добавлен в правильный server.conf"
 pass "04_add_client.sh добавляет клиента в выбранный интерфейс"
 
-step "Тест 05_update_amneziawg.sh"
+step "Тест 05_update_amneziawg.sh append-only install.env"
+printf '# install env sentinel before update\n' >> "$INSTALL_STATE_FILE"
 run_in_env "${BUNDLE_ROOT}/scripts/05_update_amneziawg.sh"
-pass "05_update_amneziawg.sh выполняется на заглушках"
+grep -q '^# install env sentinel before update$' "$INSTALL_STATE_FILE" || fail "install.env был перезаписан при update"
+grep -q 'Appended by AmneziaWG bash bundle' "$INSTALL_STATE_FILE" || fail "install.env не получил append-only блок при update"
+pass "05_update_amneziawg.sh выполняется на заглушках и не перезаписывает install.env"
 
 step "Тест единого мастера --status"
 run_in_env "${BUNDLE_ROOT}/scripts/00_manage.sh" --status > "${TMP_ROOT}/status.txt"

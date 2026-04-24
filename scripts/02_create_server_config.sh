@@ -45,8 +45,8 @@ usage() {
 
 Защита от поломки старого интерфейса:
   - по умолчанию предлагается следующее свободное имя awg0, awg1, ...;
-  - если указать уже существующий интерфейс, скрипт спросит подтверждение;
-  - при перезаписи существующего .conf все старые peer-клиенты этого интерфейса будут потеряны.
+  - если указать уже существующий интерфейс, скрипт откажется продолжать;
+  - существующие .conf, ключи и клиенты не перезаписываются.
 
 Переменные окружения для неинтерактивного запуска:
   VPN_IF_DEFAULT=awg1
@@ -55,7 +55,7 @@ usage() {
   SERVER_ADDR_V6_DEFAULT=fd42:42:43::1/64
   SERVER_MTU_DEFAULT=1280
   CLIENT_MTU_DEFAULT=1280
-  OVERWRITE_EXISTING_IFACE=no|yes|ask
+  OVERWRITE_EXISTING_IFACE оставлена только для совместимости; перезапись запрещена всегда.
 EOF_USAGE
 }
 
@@ -69,6 +69,7 @@ generate_server_keys_if_needed() {
     local keys_dir="$2"
     local server_private="$keys_dir/server_private.key"
     local server_public="$keys_dir/server_public.key"
+    local private_key public_key
 
     ensure_dir "$keys_dir"
     if [[ -s "$server_private" && -s "$server_public" ]]; then
@@ -76,19 +77,22 @@ generate_server_keys_if_needed() {
         return 0
     fi
 
-    umask 077
-    if [[ -s "$server_private" && ! -s "$server_public" ]]; then
-        log "server_private.key уже есть, восстанавливаю server_public.key"
-        "$awg_bin" pubkey < "$server_private" > "$server_public"
-        chmod 600 "$server_private"
-        chmod 644 "$server_public"
+    if [[ -s "$server_private" && ! -e "$server_public" ]]; then
+        log "server_private.key уже есть, создаю отсутствующий server_public.key без изменения private key"
+        public_key="$("$awg_bin" pubkey < "$server_private" | strip_cr)"
+        printf '%s\n' "$public_key" | write_new_file_from_stdin "$server_public" 644
         return 0
     fi
 
+    if [[ -e "$server_private" || -e "$server_public" ]]; then
+        die "Найдены неполные/пустые ключи в ${keys_dir}. Не перезаписываю старые файлы; проверьте их вручную."
+    fi
+
     log "Генерирую ключи сервера"
-    "$awg_bin" genkey | tee "$server_private" | "$awg_bin" pubkey > "$server_public"
-    chmod 600 "$server_private"
-    chmod 644 "$server_public"
+    private_key="$("$awg_bin" genkey | strip_cr)"
+    public_key="$(printf '%s' "$private_key" | "$awg_bin" pubkey | strip_cr)"
+    printf '%s\n' "$private_key" | write_new_file_from_stdin "$server_private" 600
+    printf '%s\n' "$public_key" | write_new_file_from_stdin "$server_public" 644
     ok "Ключи сервера созданы"
 }
 
@@ -111,13 +115,8 @@ write_server_config() {
     local private_key
 
     private_key="$(strip_cr < "$private_key_file")"
-    if [[ -f "$conf_file" ]]; then
-        local backup
-        backup="$(backup_file "$conf_file")"
-        warn "Существующий конфиг сохранён в: $backup"
-    fi
 
-    cat > "$conf_file" <<EOF_CONF
+    cat <<EOF_CONF | write_new_file_from_stdin "$conf_file" 600
 [Interface]
 PrivateKey = ${private_key}
 Address = ${addr_v4}
@@ -135,9 +134,8 @@ H3 = ${h3}
 H4 = ${h4}
 
 # Клиенты добавляются ниже скриптом 04_add_client.sh.
-# Не запускайте повторное создание этого же интерфейса, если хотите сохранить клиентов.
+# Повторное создание этого же интерфейса запрещено, чтобы сохранить клиентов.
 EOF_CONF
-    chmod 600 "$conf_file"
 }
 
 main() {
@@ -195,14 +193,8 @@ main() {
     server_conf="$(server_conf_for_iface "$vpn_if")"
 
     if [[ -f "$server_conf" ]]; then
-        case "$OVERWRITE_EXISTING_IFACE" in
-            yes) warn "OVERWRITE_EXISTING_IFACE=yes: существующий $server_conf будет заменён, клиенты этого интерфейса будут потеряны" ;;
-            no) die "Интерфейс $vpn_if уже существует: $server_conf" ;;
-            *)
-                warn "Интерфейс $vpn_if уже существует. Перезапись удалит всех клиентов из этого .conf."
-                confirm "Перезаписать ${server_conf}?" N || die "Операция отменена, существующий интерфейс не изменён"
-                ;;
-        esac
+        [[ "$OVERWRITE_EXISTING_IFACE" != "ask" ]] && warn "OVERWRITE_EXISTING_IFACE=${OVERWRITE_EXISTING_IFACE} проигнорирована: перезапись запрещена политикой сохранения старых данных"
+        die "Интерфейс $vpn_if уже существует: $server_conf. Создайте новый интерфейс со свободным именем ($(next_iface_name)) или добавьте клиента через 04_add_client.sh."
     fi
 
     service_name="awg-quick@${vpn_if}.service"
@@ -222,9 +214,12 @@ main() {
     ok "systemd unit: $unit_file"
 
     if confirm "Поднять интерфейс ${vpn_if} прямо сейчас?" Y; then
-        systemctl stop "$service_name" >/dev/null 2>&1 || true
-        systemctl start "$service_name"
-        ok "Интерфейс ${vpn_if} поднят"
+        if systemctl is-active "$service_name" >/dev/null 2>&1; then
+            warn "${service_name} уже активен. Не останавливаю и не перезапускаю существующий service автоматически; запустите вручную после проверки."
+        else
+            systemctl start "$service_name"
+            ok "Интерфейс ${vpn_if} поднят"
+        fi
     else
         warn "Интерфейс не поднят. Позже можно выполнить: sudo systemctl start $service_name"
     fi

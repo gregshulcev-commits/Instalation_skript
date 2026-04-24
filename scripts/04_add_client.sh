@@ -37,7 +37,7 @@ usage() {
   ENDPOINT_HOST_OVERRIDE=example   - endpoint host для client.conf
   ENDPOINT_PORT_OVERRIDE=443       - endpoint port для client.conf
   DNS_SERVERS_OVERRIDE='1.1.1.1'   - DNS для client.conf
-  ROLLBACK_ON_RESTART_FAIL=yes     - восстановить server.conf из backup, если restart сервиса упал
+  ROLLBACK_ON_RESTART_FAIL оставлена для совместимости; откат отключён, чтобы не перезаписывать server.conf
   QR_OUTPUT=no                     - не печатать QR-код
 EOF_USAGE
 }
@@ -78,19 +78,18 @@ generate_client_conf() {
     local allowed_ips="${11}"
     local enable_ipv6="${12}"
 
-    cat > "$file" <<EOF_CLIENT
+    {
+        cat <<EOF_CLIENT
 [Interface]
 PrivateKey = ${client_privkey}
 Address = ${client_ipv4}/32
 EOF_CLIENT
-
-    if [[ "$enable_ipv6" == "yes" ]]; then
-        printf 'Address = %s/128\n' "$client_ipv6" >> "$file"
-    else
-        printf '# Address = %s/128\n' "$client_ipv6" >> "$file"
-    fi
-
-    cat >> "$file" <<EOF_CLIENT
+        if [[ "$enable_ipv6" == "yes" ]]; then
+            printf 'Address = %s/128\n' "$client_ipv6"
+        else
+            printf '# Address = %s/128\n' "$client_ipv6"
+        fi
+        cat <<EOF_CLIENT
 DNS = ${dns_servers}
 MTU = ${client_mtu}
 
@@ -102,7 +101,7 @@ AllowedIPs = ${allowed_ips}
 Endpoint = ${endpoint}
 PersistentKeepalive = ${PERSISTENT_KEEPALIVE}
 EOF_CLIENT
-    chmod 600 "$file"
+    } | write_new_file_from_stdin "$file" 600
 }
 
 main() {
@@ -191,9 +190,11 @@ main() {
         server_public_key="$(strip_cr < "$server_pubkey_file")"
     else
         [[ -s "$server_private_key_file" ]] || die "Не найден server_private.key / server_public.key"
+        if [[ -e "$server_pubkey_file" ]]; then
+            die "${server_pubkey_file} существует, но пустой/битый. Не перезаписываю его автоматически."
+        fi
         server_public_key="$(calc_public_key "$awg_bin" "$server_private_key_file" | strip_cr)"
-        printf '%s\n' "$server_public_key" > "$server_pubkey_file"
-        chmod 644 "$server_pubkey_file"
+        printf '%s\n' "$server_public_key" | write_new_file_from_stdin "$server_pubkey_file" 644
     fi
 
     obfs_block="$(get_obfuscation_block "$server_conf")"
@@ -212,15 +213,14 @@ main() {
     if ! systemctl restart "$service_name"; then
         restart_ok="no"
         warn "Не удалось перезапустить ${service_name}. Проверьте: journalctl -u ${service_name} -n 100 --no-pager"
-        if [[ "$ROLLBACK_ON_RESTART_FAIL" == "yes" && -n "$backup" ]]; then
-            cp -a "$backup" "$server_conf"
-            warn "server.conf восстановлен из backup: $backup"
+        if [[ "$ROLLBACK_ON_RESTART_FAIL" == "yes" ]]; then
+            warn "ROLLBACK_ON_RESTART_FAIL=yes проигнорирован: откат потребовал бы перезаписать ${server_conf}. Старое содержимое сохранено в backup, новый peer был только дописан."
         fi
     fi
 
     ok "Клиент добавлен: ${client_name}"
     ok "Интерфейс: ${vpn_if}"
-    ok "Серверный конфиг обновлён: ${server_conf}"
+    ok "Серверный конфиг дополнен: ${server_conf}"
     ok "Клиентский конфиг создан: ${client_conf_file}"
     ok "MTU клиента: ${client_mtu}"
     [[ "$restart_ok" == "yes" ]] && ok "Сервис перезапущен: ${service_name}"

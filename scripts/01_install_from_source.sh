@@ -14,6 +14,8 @@ SKIP_PACKAGE_INSTALL="${SKIP_PACKAGE_INSTALL:-no}"
 SKIP_BUILD="${SKIP_BUILD:-no}"
 SKIP_MODPROBE="${SKIP_MODPROBE:-no}"
 INSTALL_QRENCODE="${INSTALL_QRENCODE:-no}"
+DKMS_ROOT="${DKMS_ROOT:-/usr/src}"
+TOOLS_INSTALL_ROOT="${TOOLS_INSTALL_ROOT:-${INSTALL_PREFIX}/libexec/amneziawg-bundle-tools}"
 
 usage() {
     cat <<'EOF_USAGE'
@@ -34,6 +36,7 @@ usage() {
   SKIP_PACKAGE_INSTALL=yes  - пропустить установку пакетов
   SKIP_BUILD=yes            - не собирать модуль и утилиты (для тестов)
   SKIP_MODPROBE=yes         - не вызывать modprobe amneziawg
+  TOOLS_INSTALL_ROOT=...    - каталог для новых версий awg-tools; старые бинарники не перезаписываются
 EOF_USAGE
 }
 
@@ -100,23 +103,16 @@ prepare_source_tree() {
     local base_name="$1"
     local repo_url="$2"
     local cache_dir="$3"
-    local archive extracted
+    local archive extracted target_dir
 
     ensure_dir "$(dirname "$cache_dir")"
+    target_dir="$(next_available_path "$cache_dir")"
 
     if repo_is_reachable "$repo_url"; then
         require_cmd git
-        if [[ -d "$cache_dir/.git" ]]; then
-            log "Обновляю исходники: $cache_dir" >&2
-            git -C "$cache_dir" fetch --tags --prune origin
-            git -C "$cache_dir" checkout master || true
-            git -C "$cache_dir" pull --ff-only origin master || true
-        else
-            rm -rf "$cache_dir"
-            log "Клонирую исходники: $repo_url" >&2
-            git clone --depth 1 "$repo_url" "$cache_dir"
-        fi
-        printf '%s\n' "$cache_dir"
+        log "Клонирую исходники без изменения старого cache: $repo_url -> $target_dir" >&2
+        git clone --depth 1 "$repo_url" "$target_dir"
+        printf '%s\n' "$target_dir"
         return 0
     fi
 
@@ -125,10 +121,8 @@ prepare_source_tree() {
 
     log "Интернет недоступен. Использую локальный архив: $archive" >&2
     extracted="$(extract_source_archive "$archive" "${cache_dir}.extract")"
-    rm -rf "$cache_dir"
-    mkdir -p "$(dirname "$cache_dir")"
-    cp -a "$extracted" "$cache_dir"
-    printf '%s\n' "$cache_dir"
+    cp -a -- "$extracted" "$target_dir"
+    printf '%s\n' "$target_dir"
 }
 
 compute_version() {
@@ -147,28 +141,42 @@ compute_version() {
     printf '%s\n' "$version"
 }
 
+safe_dkms_version() {
+    local version="$1"
+    local candidate="$version"
+    if [[ -e "${DKMS_ROOT}/amneziawg-${candidate}" ]] || { command -v dkms >/dev/null 2>&1 && dkms status -m amneziawg -v "$candidate" >/dev/null 2>&1; }; then
+        candidate="${version}.bundle$(date +%Y%m%d%H%M%S).$$"
+        warn "DKMS version ${version} уже существует; старую версию не меняю, новая будет: ${candidate}"
+    fi
+    printf '%s\n' "$candidate"
+}
+
 prepare_kmod_source_for_dkms() {
     local repo_dir="$1"
     local version="$2"
     local src_dir="$repo_dir/src"
-    local dkms_dir="/usr/src/amneziawg-${version}"
+    local dkms_dir="${DKMS_ROOT}/amneziawg-${version}"
 
     [[ -d "$src_dir" ]] || die "Не найдена папка src в $repo_dir"
-
-    if [[ -e "/lib/modules/$(uname -r)/build" ]]; then
-        ln -sfn "/lib/modules/$(uname -r)/build" "$src_dir/kernel" || true
+    if [[ -e "$dkms_dir" ]]; then
+        die "Отказ перезаписывать существующий DKMS source dir: $dkms_dir"
     fi
 
-    if [[ -f "$src_dir/dkms.conf" ]] && grep -q '^PACKAGE_VERSION=' "$src_dir/dkms.conf"; then
-        sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${version}\"/" "$src_dir/dkms.conf"
-    fi
-    if [[ -f "$src_dir/Makefile" ]] && grep -q '^WIREGUARD_VERSION = ' "$src_dir/Makefile"; then
-        sed -i "s/^WIREGUARD_VERSION = .*/WIREGUARD_VERSION = ${version}/" "$src_dir/Makefile"
-    fi
-
-    rm -rf "$dkms_dir"
     mkdir -p "$dkms_dir"
-    cp -a "$src_dir/." "$dkms_dir/"
+    cp -a -- "$src_dir/." "$dkms_dir/"
+
+    if [[ -e "/lib/modules/$(uname -r)/build" && ! -e "$dkms_dir/kernel" ]]; then
+        ln -s "/lib/modules/$(uname -r)/build" "$dkms_dir/kernel" || true
+    elif [[ -e "$dkms_dir/kernel" ]]; then
+        warn "${dkms_dir}/kernel уже существует; не меняю"
+    fi
+
+    if [[ -f "$dkms_dir/dkms.conf" ]] && grep -q '^PACKAGE_VERSION=' "$dkms_dir/dkms.conf"; then
+        sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${version}\"/" "$dkms_dir/dkms.conf"
+    fi
+    if [[ -f "$dkms_dir/Makefile" ]] && grep -q '^WIREGUARD_VERSION = ' "$dkms_dir/Makefile"; then
+        sed -i "s/^WIREGUARD_VERSION = .*/WIREGUARD_VERSION = ${version}/" "$dkms_dir/Makefile"
+    fi
 
     printf '%s\n' "$dkms_dir"
 }
@@ -187,7 +195,6 @@ install_kmod_via_dkms() {
     require_cmd dkms
     dkms_dir="$(prepare_kmod_source_for_dkms "$repo_dir" "$version")"
     log "Собираю модуль ядра из $dkms_dir через DKMS"
-    dkms remove -m amneziawg -v "$version" --all >/dev/null 2>&1 || true
     dkms add -m amneziawg -v "$version"
     dkms build -m amneziawg -v "$version"
     dkms install -m amneziawg -v "$version" --force
@@ -204,6 +211,7 @@ install_kmod_via_dkms() {
 install_tools_from_source() {
     local repo_dir="$1"
     local src_dir="$repo_dir/src"
+    local tools_prefix
 
     [[ -d "$src_dir" ]] || die "Не найдена папка src в $repo_dir"
     [[ "$SKIP_BUILD" == "yes" ]] && {
@@ -212,14 +220,18 @@ install_tools_from_source() {
     }
 
     require_cmd make
-    log "Собираю awg-tools"
+    tools_prefix="$(next_available_path "$TOOLS_INSTALL_ROOT")"
+    mkdir -p "$(dirname "$tools_prefix")"
+    log "Собираю awg-tools" >&2
     make -C "$src_dir" clean >/dev/null 2>&1 || true
-    make -C "$src_dir"
-    make -C "$src_dir" install PREFIX="$INSTALL_PREFIX" WITH_WGQUICK=yes WITH_SYSTEMDUNITS=yes
+    make -C "$src_dir" >&2
+    log "Устанавливаю awg-tools в новый каталог без перезаписи старых бинарников: $tools_prefix" >&2
+    make -C "$src_dir" install PREFIX="$tools_prefix" WITH_WGQUICK=yes WITH_SYSTEMDUNITS=yes >&2
+    printf '%s\n' "$tools_prefix"
 }
 
 main() {
-    local kmod_repo tools_repo version awg_bin awg_quick_bin
+    local kmod_repo tools_repo version awg_bin awg_quick_bin tools_install_prefix
 
     require_root
     install_packages
@@ -228,12 +240,19 @@ main() {
     tools_repo="$(prepare_source_tree "amneziawg-tools" "$TOOLS_REPO_URL" "$TOOLS_CACHE_DIR")"
 
     version="$(compute_version "$kmod_repo")"
+    version="$(safe_dkms_version "$version")"
     log "Версия исходников модуля для DKMS: ${version}"
     install_kmod_via_dkms "$kmod_repo" "$version"
-    install_tools_from_source "$tools_repo"
+    tools_install_prefix="$(install_tools_from_source "$tools_repo")"
+    TOOLS_INSTALL_PREFIX="$tools_install_prefix"
 
-    awg_bin="$(first_cmd_path awg "${INSTALL_PREFIX}/bin/awg" /usr/local/bin/awg /usr/bin/awg)" || die "После установки не найден awg"
-    awg_quick_bin="$(first_cmd_path awg-quick "${INSTALL_PREFIX}/bin/awg-quick" /usr/local/bin/awg-quick /usr/bin/awg-quick)" || die "После установки не найден awg-quick"
+    if [[ -n "$tools_install_prefix" ]]; then
+        awg_bin="$(first_existing_exec "${tools_install_prefix}/bin/awg" "${tools_install_prefix}/sbin/awg")" || die "После безопасной установки не найден awg в $tools_install_prefix"
+        awg_quick_bin="$(first_existing_exec "${tools_install_prefix}/bin/awg-quick" "${tools_install_prefix}/sbin/awg-quick")" || die "После безопасной установки не найден awg-quick в $tools_install_prefix"
+    else
+        awg_bin="$(first_cmd_path awg "${INSTALL_PREFIX}/bin/awg" /usr/local/bin/awg /usr/bin/awg)" || die "После установки не найден awg"
+        awg_quick_bin="$(first_cmd_path awg-quick "${INSTALL_PREFIX}/bin/awg-quick" /usr/local/bin/awg-quick /usr/bin/awg-quick)" || die "После установки не найден awg-quick"
+    fi
 
     ensure_dir "$STATE_DIR"
     ensure_sysctl_kv "$SYSCTL_FILE" "net.ipv4.ip_forward" "1"
