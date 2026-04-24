@@ -1,5 +1,5 @@
 AmneziaWG bundle test report
-Generated: 2026-04-24 19:06:27 UTC
+Generated: 2026-04-24 20:34:35 UTC
 
 == Подготовка окружения ==
 [PASS] Подготовлены fake sources и заглушки
@@ -16,11 +16,11 @@ Generated: 2026-04-24 19:06:27 UTC
 == Тест 02_create_server_config.sh для awg0 ==
 [PASS] 02_create_server_config.sh создаёт awg0.conf и manager env
 
-== Тест 03_setup_nftables.sh ==
-[PASS] 03_setup_nftables.sh создаёт и применяет nftables.conf
+== Тест 03_setup_nftables.sh создаёт пустой firewall по безопасному template ==
+[PASS] 03_setup_nftables.sh создаёт template с policy drop, SSH allow и NAT
 
 == Тест 04_add_client.sh IPv4-only по умолчанию ==
-[PASS] 04_add_client.sh дописывает peer и создаёт client.conf
+[PASS] 04_add_client.sh дописывает Grafana-friendly peer, резервирует IPv6 и создаёт client.conf
 
 == Тест запрета перезаписи существующего интерфейса ==
 [PASS] 02_create_server_config.sh не перезаписывает существующий интерфейс даже при OVERWRITE_EXISTING_IFACE=yes
@@ -28,8 +28,8 @@ Generated: 2026-04-24 19:06:27 UTC
 == Тест создания второго интерфейса awg1 ==
 [PASS] Второй интерфейс создаётся рядом с первым
 
-== Тест nftables для двух интерфейсов append-only ==
-[PASS] 03_setup_nftables.sh учитывает несколько интерфейсов
+== Тест nftables для двух интерфейсов: аккуратное обновление существующего native firewall ==
+[PASS] 03_setup_nftables.sh обновляет существующий firewall без дублей и сохраняет redirect
 
 == Тест добавления клиента на awg1 ==
 [PASS] 04_add_client.sh добавляет клиента в выбранный интерфейс

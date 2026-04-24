@@ -82,15 +82,21 @@ README по скриптам
 
   /etc/amnezia/amneziawg/*.conf
 
-и создаёт или дополняет firewall/NAT для всех интерфейсов сразу.
+и создаёт или безопасно обновляет firewall/NAT для всех интерфейсов сразу.
 
-Добавляет:
-- named set vpn_ports со всеми ListenPort;
-- named set vpn_ifaces со всеми awgN;
-- IPv4 masquerade;
-- enable/restart awg-quick@<iface>.service.
+Добавляет/обновляет:
+- UDP ListenPort всех awgN на внешнем интерфейсе;
+- input policy drop при создании нового template;
+- явное разрешение SSH-порта, по умолчанию 22/tcp;
+- IPv4 masquerade для всех awgN;
+- timestamp-backup перед изменением существующего /etc/nftables.conf.
 
-Безопасность: /etc/nftables.conf не перезаписывается. Если файла нет, он создаётся. Если файл уже есть, скрипт дописывает table ip amneziawg_bundle или append-команды в конец. Глобальный flush ruleset не используется.
+Режимы:
+- если nftables.conf пустой или отсутствует, создаётся table inet filter + table inet nat;
+- если уже есть table inet filter + table inet nat, обновляются существующие chain input/postrouting без второй input-chain;
+- если формат непонятен, файл не меняется и печатаются ручные инструкции.
+
+Скрипт не использует глобальный flush ruleset и не перезапускает awg-quick@awg0/awg1, чтобы не трогать работающие интерфейсы.
 
 04_add_client.sh
 ----------------
@@ -104,11 +110,21 @@ README по скриптам
 
 Если интерфейс не указан и их несколько, скрипт предложит выбрать.
 
-По умолчанию клиент создаётся IPv4-only:
+server.conf получает Grafana-friendly peer:
 
+  [Peer]
+  # friendly_name=phone
+  PublicKey = ...
+  PresharedKey = ...
+  AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
+
+По умолчанию client.conf остаётся IPv4-only, а IPv6 Address закомментирован:
+
+  Address = 10.8.1.2/32
+  # Address = fd42:42:42::2/128
   AllowedIPs = 0.0.0.0/0
 
-Для IPv6 нужно явно задать:
+Для IPv6-маршрутизации в client.conf нужно явно задать:
 
   CLIENT_ENABLE_IPV6=yes
 

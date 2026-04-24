@@ -17,17 +17,15 @@ CONFIG_GUIDE
   MTU
   Jc/Jmin/Jmax/S1/S2/H1/H2/H3/H4
 
-Клиенты добавляются ниже в виде блоков:
+Клиенты добавляются ниже в Grafana-friendly формате:
 
-  ### Client phone
   [Peer]
+  # friendly_name=phone
   PublicKey = ...
   PresharedKey = ...
-  AllowedIPs = 10.8.1.2/32
-
-Если CLIENT_ENABLE_IPV6=yes, peer будет содержать:
-
   AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
+
+IPv6 /128 в server.conf добавляется всегда, чтобы адрес был закреплён за peer и был виден мониторингу. В client.conf IPv6 Address по умолчанию остаётся закомментированным, пока вы явно не включите IPv6-маршрутизацию.
 
 Подсети
 -------
@@ -133,12 +131,42 @@ manager env
 
 Append-only и backup
 --------------------
-При добавлении клиента server.conf только дополняется новым [Peer] в конце файла. Перед append создаётся отдельная резервная копия вида:
+При добавлении клиента server.conf только дополняется новым [Peer] в конце файла. Перед append создаётся timestamp-backup в отдельной папке:
 
-  file.bak
-  file.bak.YYYYMMDD-HHMMSS-PID
+  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-server-conf-awg0/awg0.conf
+  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-server-conf-awg1/awg1.conf
+
+При изменении существующего nftables.conf создаётся backup:
+
+  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-nftables/nftables.conf
 
 Автоматический rollback отключён: восстановление backup поверх server.conf было бы перезаписью старого файла. Если перезапуск сервиса не удался, backup остаётся рядом, а решение об откате принимает администратор вручную.
+
+nftables native update
+----------------------
+03_setup_nftables.sh больше не добавляет отдельную table ip amneziawg_bundle рядом с вашим рабочим firewall, если уже найдены table inet filter и table inet nat.
+
+Для существующего native firewall он пытается сделать ровно такие изменения:
+
+  iifname "ens3" udp dport 56789 accept
+
+заменить на:
+
+  iifname "ens3" udp dport { 56789, 520 } accept
+
+и:
+
+  iifname "awg0" oifname "ens3" masquerade
+
+заменить на:
+
+  iifname { "awg0", "awg1" } oifname "ens3" masquerade
+
+Существующие redirect/DNAT строки, например:
+
+  udp dport { 53, 443 } redirect to :56789
+
+сохраняются. Если структура nftables непонятна, скрипт не меняет файл и печатает ручные инструкции.
 
 Установка awg-tools
 -------------------

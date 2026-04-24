@@ -26,14 +26,24 @@ usage() {
   - читает manager-<interface>.env;
   - генерирует ключи клиента и PresharedKey;
   - выбирает следующий свободный IPv4 внутри /24 подсети интерфейса;
+  - резервирует IPv6 /128 на сервере;
   - спрашивает/использует MTU клиента;
-  - добавляет [Peer] в серверный .conf;
-  - создаёт готовый клиентский .conf;
-  - перезапускает awg-quick@<iface>.service.
+  - добавляет [Peer] в server.conf в Grafana-friendly формате;
+  - создаёт готовый client.conf;
+  - перезапускает только awg-quick@<iface>.service.
+
+Формат server.conf для клиента:
+
+  [Peer]
+  # friendly_name=<client_name>
+  PublicKey = ...
+  PresharedKey = ...
+  AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
 
 Переменные:
   CLIENT_MTU=1280                  - MTU в клиентском конфиге без вопроса
-  CLIENT_ENABLE_IPV6=yes|no        - добавить IPv6 Address и ::/0 в AllowedIPs. По умолчанию no.
+  CLIENT_ENABLE_IPV6=yes|no        - раскомментировать IPv6 Address и добавить ::/0 в client AllowedIPs. По умолчанию no.
+                                     В server.conf IPv6 /128 добавляется всегда для учёта адреса клиента.
   ENDPOINT_HOST_OVERRIDE=example   - endpoint host для client.conf
   ENDPOINT_PORT_OVERRIDE=443       - endpoint port для client.conf
   DNS_SERVERS_OVERRIDE='1.1.1.1'   - DNS для client.conf
@@ -56,8 +66,8 @@ append_peer_to_server_conf() {
 
     cat >> "$conf" <<EOF_PEER
 
-### Client ${client_name}
 [Peer]
+# friendly_name=${client_name}
 PublicKey = ${client_pubkey}
 PresharedKey = ${client_psk}
 AllowedIPs = ${allowed_ips}
@@ -101,6 +111,9 @@ AllowedIPs = ${allowed_ips}
 Endpoint = ${endpoint}
 PersistentKeepalive = ${PERSISTENT_KEEPALIVE}
 EOF_CLIENT
+        if [[ "$enable_ipv6" != "yes" ]]; then
+            printf '# IPv6 address is reserved on the server side; enable CLIENT_ENABLE_IPV6=yes to route ::/0 through this client.\n'
+        fi
     } | write_new_file_from_stdin "$file" 600
 }
 
@@ -162,18 +175,19 @@ main() {
         enable_ipv6="no"
     fi
     if [[ -z "$CLIENT_ENABLE_IPV6_WAS_SET" && is_interactive ]]; then
-        if confirm "Маршрутизировать IPv6 через VPN для этого клиента?" N; then
+        if confirm "Маршрутизировать IPv6 через VPN для этого клиента? IPv6 Address в client.conf по умолчанию остаётся закомментированным" N; then
             enable_ipv6="yes"
         else
             enable_ipv6="no"
         fi
     fi
 
+    # The server peer always reserves both IPv4 and IPv6 addresses for the client.
+    # The client config keeps IPv6 commented by default unless routing was explicitly enabled.
+    server_allowed_ips="${client_ipv4}/32, ${client_ipv6}/128"
     if [[ "$enable_ipv6" == "yes" ]]; then
-        server_allowed_ips="${client_ipv4}/32, ${client_ipv6}/128"
         client_allowed_ips="0.0.0.0/0, ::/0"
     else
-        server_allowed_ips="${client_ipv4}/32"
         client_allowed_ips="0.0.0.0/0"
     fi
 
@@ -205,7 +219,7 @@ main() {
 
     generate_client_conf "$client_conf_file" "$client_privkey" "$client_ipv4" "$client_ipv6" "$dns_servers" "$client_mtu" "$obfs_block" "$server_public_key" "$client_psk" "$endpoint" "$client_allowed_ips" "$enable_ipv6"
 
-    backup="$(backup_file "$server_conf" || true)"
+    backup="$(backup_file "$server_conf" "server-conf-${vpn_if}" || true)"
     [[ -n "$backup" ]] && warn "Резервная копия server.conf: $backup"
     append_peer_to_server_conf "$server_conf" "$client_name" "$client_pubkey" "$client_psk" "$server_allowed_ips"
 

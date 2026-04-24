@@ -39,7 +39,11 @@ AmneziaWG bash bundle
 Исправленная версия придерживается append/create-only политики для bundle-данных:
 - существующие interface/server/client .conf не перезаписываются;
 - install.env, manager.env, firewall.env и sysctl дополняются, старые строки остаются как были;
-- /etc/nftables.conf не заменяется целиком и не получает глобальный flush ruleset;
+- /etc/nftables.conf получает timestamp-backup перед изменением;
+- если firewall пустой, создаётся безопасный template с input policy drop и явным SSH allow;
+- если firewall уже есть в понятном формате table inet filter/nat, обновляются существующие правила без второй input-chain;
+- если firewall непонятен, автоматическое изменение останавливается и печатаются ручные инструкции;
+- глобальный flush ruleset не используется;
 - source/cache/DKMS пути создаются заново, старые каталоги не удаляются;
 - awg-tools при реальной сборке ставятся в новый отдельный каталог TOOLS_INSTALL_ROOT, а не поверх старых awg/awg-quick бинарников.
 
@@ -85,7 +89,9 @@ AmneziaWG bash bundle
   awg0: 10.8.1.1/24 и fd42:42:42::1/64
   awg1: 10.8.2.1/24 и fd42:42:43::1/64
 
-После создания нового интерфейса скрипт предложит дополнить nftables/NAT для всех интерфейсов. Это важно: firewall-файл должен учитывать все ListenPort и все AWG interface names одновременно. Старые строки nftables.conf при этом не переписываются: новые элементы добавляются в конец файла.
+После создания нового интерфейса скрипт предложит обновить nftables/NAT для всех интерфейсов. Это важно: firewall-файл должен учитывать все ListenPort и все AWG interface names одновременно.
+
+Новая логика nftables не создаёт вторую input-chain рядом с уже существующей. Если у вас уже есть table inet filter и table inet nat, скрипт пытается аккуратно обновить существующие строки: объединить AWG UDP-порты и masquerade для awg0/awg1, сохранить ваши redirect/DNAT правила и сделать timestamp-backup. Если структура firewall непонятна, скрипт не меняет файл автоматически и показывает, что добавить вручную.
 
 Добавление клиента
 ------------------
@@ -107,21 +113,35 @@ AmneziaWG bash bundle
 При добавлении клиента скрипт:
 - берёт параметры из manager-<iface>.env;
 - выбирает следующий свободный IPv4 в /24 подсети интерфейса;
+- резервирует соответствующий IPv6 /128 на сервере;
 - спрашивает MTU клиента или использует DEFAULT_CLIENT_MTU;
 - генерирует ключи клиента и PresharedKey;
 - создаёт client.conf;
-- добавляет peer в правильный server.conf;
+- добавляет peer в правильный server.conf в формате с # friendly_name=... для Grafana;
+- перед append создаёт timestamp-backup server.conf;
 - перезапускает только нужный awg-quick@<iface>.service.
+
+Формат server.conf для клиента:
+
+  [Peer]
+  # friendly_name=phone
+  PublicKey = ...
+  PresharedKey = ...
+  AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
 
 IPv6 для клиентов
 -----------------
-По умолчанию клиент создаётся в IPv4-only режиме:
+По умолчанию клиент создаётся в IPv4-only режиме, но IPv6-адрес клиента резервируется на сервере:
 
-  Address = 10.8.X.Y/32
-  # Address = fd42:...::Y/128
-  AllowedIPs = 0.0.0.0/0
+  server.conf:
+    AllowedIPs = 10.8.X.Y/32, fd42:...::Y/128
 
-Это сделано безопаснее, потому что nftables в bundle настраивает только IPv4 NAT, а у многих серверов нет рабочего внешнего IPv6.
+  client.conf:
+    Address = 10.8.X.Y/32
+    # Address = fd42:...::Y/128
+    AllowedIPs = 0.0.0.0/0
+
+Это сделано безопаснее, потому что nftables в bundle настраивает только IPv4 NAT, а у многих серверов нет рабочего внешнего IPv6. При этом адрес IPv6 уже закреплён за peer и его легко раскомментировать позже.
 
 Если вы сознательно хотите включить IPv6 в клиентском конфиге:
 
@@ -175,18 +195,28 @@ IPv6 для клиентов
 
 nftables
 --------
-Скрипт scripts/03_setup_nftables.sh собирает append-safe правила для всех найденных AWG конфигов:
+Скрипт scripts/03_setup_nftables.sh сканирует все найденные AWG конфиги:
 
   /etc/amnezia/amneziawg/*.conf
 
-Он добавляет:
+Он настраивает:
 - разрешение UDP ListenPort каждого AWG интерфейса на внешнем интерфейсе;
-- forward для всех AWG interface names;
+- input policy drop при создании нового template;
+- явное разрешение SSH-порта, по умолчанию 22/tcp;
 - IPv4 masquerade для выхода в интернет через внешний интерфейс;
-- сохранение правил в /etc/nftables.conf без перезаписи существующего файла;
-- enable/restart awg-quick@<iface>.service для найденных интерфейсов.
+- сохранение redirect/DNAT правил, если они уже были в существующем firewall.
 
-Важное поведение безопасности: скрипт не использует глобальный flush ruleset и не копирует новый файл поверх старого nftables.conf. Если /etc/nftables.conf уже существует, в конец дописывается отдельный table/append-команды AmneziaWG. Если на сервере уже есть строгий кастомный firewall, проверьте итоговую политику вручную: append-only режим сохраняет старые правила и не пытается их удалить или переупорядочить.
+Поведение по режимам:
+
+1. Если /etc/nftables.conf отсутствует или пустой, создаётся новый template с table inet filter и table inet nat.
+2. Если уже есть понятный формат table inet filter + table inet nat, скрипт обновляет существующие chain input/postrouting: объединяет AWG порты, объединяет masquerade для awg0/awg1 и удаляет старый bundle-owned table ip amneziawg_bundle из candidate.
+3. Если формат непонятный, файл не меняется: скрипт печатает ручные строки для добавления.
+
+Перед изменением существующего /etc/nftables.conf создаётся backup:
+
+  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-nftables/nftables.conf
+
+Глобальный flush ruleset не используется. AWG services из firewall-скрипта не перезапускаются, чтобы не трогать работающий awg0.
 
 Ручные скрипты
 --------------
@@ -234,11 +264,11 @@ nftables
 - append-only поведение sysctl/install.env;
 - создание awg0;
 - server MTU и DEFAULT_CLIENT_MTU;
-- nftables для одного интерфейса без flush ruleset;
-- добавление клиента IPv4-only;
+- nftables template для одного интерфейса: input policy drop, SSH allow, NAT;
+- добавление клиента IPv4-only с server-side IPv6 /128;
 - запрет перезаписи существующего awg0 даже при OVERWRITE_EXISTING_IFACE=yes;
 - создание awg1 без поломки awg0;
-- append-only дополнение nftables для двух интерфейсов;
+- безопасное обновление существующего native nftables с redirect 53/443 без дублей;
 - добавление клиента именно в awg1;
 - единый мастер-скрипт --status.
 

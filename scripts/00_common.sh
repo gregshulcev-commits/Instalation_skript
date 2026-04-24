@@ -88,12 +88,59 @@ append_or_create_file_from_stdin() {
     fi
 }
 
+timestamp_for_backup() {
+    date +%Y%m%d-%H%M%S
+}
+
+create_timestamped_backup_dir() {
+    local label="${1:-backup}"
+    local root="${BACKUP_ROOT:-${STATE_DIR}/backups}"
+    local stamp dir i
+    stamp="$(timestamp_for_backup)"
+    label="$(printf '%s' "$label" | tr -c 'A-Za-z0-9_.-' '_')"
+    dir="${root}/${stamp}-${label}"
+    if [[ ! -e "$dir" ]]; then
+        mkdir -p "$dir"
+        chmod 700 "$dir" 2>/dev/null || true
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    for i in $(seq 1 999); do
+        dir="${root}/${stamp}-${label}.${i}"
+        if [[ ! -e "$dir" ]]; then
+            mkdir -p "$dir"
+            chmod 700 "$dir" 2>/dev/null || true
+            printf '%s\n' "$dir"
+            return 0
+        fi
+    done
+    die "Не удалось создать backup directory в ${root}"
+}
+
+backup_file_to_dir() {
+    local file="$1"
+    local dir="$2"
+    local target
+    [[ -e "$file" ]] || return 0
+    ensure_dir "$dir"
+    target="${dir}/$(basename "$file")"
+    if [[ -e "$target" ]]; then
+        target="$(next_available_path "$target")"
+    fi
+    cp -a -- "$file" "$target"
+    printf '%s\n' "$target"
+}
+
 backup_file() {
     local file="$1"
+    local label="${2:-}"
+    if [[ -z "$label" ]]; then
+        label="$(basename "$file")"
+    fi
     if [[ -e "$file" ]]; then
-        local backup
-        backup="$(next_available_path "${file}.bak")"
-        cp -a -- "$file" "$backup"
+        local dir backup
+        dir="$(create_timestamped_backup_dir "$label")"
+        backup="$(backup_file_to_dir "$file" "$dir")"
         printf '%s\n' "$backup"
     fi
 }
@@ -436,7 +483,8 @@ validate_ipv6_cidr_64() {
 client_exists_in_conf() {
     local conf="$1"
     local name="$2"
-    grep -q "^### Client ${name}$" "$conf"
+    [[ -f "$conf" ]] || return 1
+    grep -Eq "^(### Client ${name}|#[[:space:]]*friendly_name=${name})$" "$conf"
 }
 
 next_free_ipv4() {
@@ -688,7 +736,9 @@ count_clients_for_iface() {
     local conf clients_dir by_conf by_files
     conf="$(server_conf_for_iface "$iface")"
     by_conf=0
-    [[ -f "$conf" ]] && by_conf="$(grep -c '^### Client ' "$conf" || true)"
+    # Count actual [Peer] blocks. Older bundle versions used ### Client comments,
+    # while the Grafana-friendly format now uses # friendly_name=<name>.
+    [[ -f "$conf" ]] && by_conf="$(grep -cE '^[[:space:]]*\[Peer\][[:space:]]*$' "$conf" || true)"
     clients_dir="$(clients_dir_for_iface "$iface")"
     by_files=0
     if [[ -d "$clients_dir" ]]; then

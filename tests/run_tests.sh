@@ -162,6 +162,8 @@ run_in_env() {
         SKIP_PACKAGE_INSTALL=yes \
         SKIP_BUILD=yes \
         QR_OUTPUT=no \
+        NFT_SAVE_CHANGES="${NFT_SAVE_CHANGES:-ask}" \
+        NFT_APPLY_NOW="${NFT_APPLY_NOW:-ask}" \
         "$script" "$@"
 }
 
@@ -242,14 +244,16 @@ grep -q '^MTU = 1280$' "$SERVER_CONF" || fail "В server.conf нет MTU"
 grep -q "DEFAULT_CLIENT_MTU='1280'" "${STATE_DIR}/manager-awg0.env" || fail "DEFAULT_CLIENT_MTU не сохранён"
 pass "02_create_server_config.sh создаёт awg0.conf и manager env"
 
-step "Тест 03_setup_nftables.sh"
-printf '\n\nY\n' | run_in_env "${BUNDLE_ROOT}/scripts/03_setup_nftables.sh"
+step "Тест 03_setup_nftables.sh создаёт пустой firewall по безопасному template"
+printf '\n\n' | NFT_SAVE_CHANGES=yes NFT_APPLY_NOW=yes run_in_env "${BUNDLE_ROOT}/scripts/03_setup_nftables.sh"
 [[ -f "$NFTABLES_CONF" ]] || fail "nftables.conf не создан"
-grep -q 'elements = { 56789 }' "$NFTABLES_CONF" || fail "В nftables.conf нет VPN порта в append-safe set"
-grep -q 'tcp dport 22' "$NFTABLES_CONF" || fail "В nftables.conf нет правила SSH"
-grep -q 'masquerade' "$NFTABLES_CONF" || fail "В nftables.conf нет masquerade"
+grep -q '^table inet filter' "$NFTABLES_CONF" || fail "В nftables.conf нет table inet filter"
+grep -q 'policy drop' "$NFTABLES_CONF" || fail "input policy должна быть drop"
+grep -q 'tcp dport 22 accept' "$NFTABLES_CONF" || fail "В nftables.conf нет правила SSH"
+grep -q 'iifname "ens3" udp dport { 56789 } accept' "$NFTABLES_CONF" || fail "В nftables.conf нет VPN порта awg0"
+grep -q 'iifname { "awg0" } oifname "ens3" masquerade' "$NFTABLES_CONF" || fail "В nftables.conf нет masquerade для awg0"
 [[ -f "$FIREWALL_ENV_FILE" ]] || fail "firewall.env не создан"
-pass "03_setup_nftables.sh создаёт и применяет nftables.conf"
+pass "03_setup_nftables.sh создаёт template с policy drop, SSH allow и NAT"
 
 step "Тест 04_add_client.sh IPv4-only по умолчанию"
 run_in_env "${BUNDLE_ROOT}/scripts/04_add_client.sh" owner_phone awg0
@@ -258,9 +262,10 @@ CLIENT_CONF="${STATE_DIR}/clients/owner_phone.conf"
 grep -q '^# Address = fd42:42:42::2/128$' "$CLIENT_CONF" || fail "В client.conf нет закомментированного IPv6 Address"
 grep -q '^AllowedIPs = 0.0.0.0/0$' "$CLIENT_CONF" || fail "В client.conf должен быть IPv4-only AllowedIPs по умолчанию"
 grep -q '^MTU = 1280$' "$CLIENT_CONF" || fail "В client.conf нет MTU клиента"
-grep -q '^### Client owner_phone$' "$SERVER_CONF" || fail "В server.conf не добавлен peer клиента"
-grep -q '^AllowedIPs = 10.8.1.2/32$' "$SERVER_CONF" || fail "В peer клиента нет IPv4-only AllowedIPs"
-pass "04_add_client.sh дописывает peer и создаёт client.conf"
+grep -q '^# friendly_name=owner_phone$' "$SERVER_CONF" || fail "В server.conf нет friendly_name для клиента"
+grep -q '^AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128$' "$SERVER_CONF" || fail "В peer клиента нет IPv4+IPv6 AllowedIPs"
+find "${STATE_DIR}/backups" -type f -name 'awg0.conf' | grep -q . || fail "Не создан timestamp backup server.conf"
+pass "04_add_client.sh дописывает Grafana-friendly peer, резервирует IPv6 и создаёт client.conf"
 
 step "Тест запрета перезаписи существующего интерфейса"
 SERVER_BEFORE="${TMP_ROOT}/awg0.before"
@@ -275,7 +280,7 @@ pass "02_create_server_config.sh не перезаписывает сущест�
 
 step "Тест создания второго интерфейса awg1"
 printf '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | \
-    VPN_IF_DEFAULT=awg1 LISTEN_PORT_DEFAULT=443 \
+    VPN_IF_DEFAULT=awg1 LISTEN_PORT_DEFAULT=520 \
     SERVER_ADDR_V4_DEFAULT=10.8.2.1/24 \
     SERVER_ADDR_V6_DEFAULT=fd42:42:43::1/64 \
     ENDPOINT_HOST_DEFAULT=89.124.86.140 \
@@ -283,23 +288,63 @@ printf '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | \
     run_in_env "${BUNDLE_ROOT}/scripts/02_create_server_config.sh"
 SERVER_CONF_2="${STATE_DIR}/awg1.conf"
 [[ -f "$SERVER_CONF_2" ]] || fail "awg1.conf не создан"
-grep -q '^ListenPort = 443$' "$SERVER_CONF_2" || fail "awg1 ListenPort не сохранён"
+grep -q '^ListenPort = 520$' "$SERVER_CONF_2" || fail "awg1 ListenPort не сохранён"
 grep -q '^MTU = 1360$' "$SERVER_CONF_2" || fail "awg1 server MTU не сохранён"
 grep -q "DEFAULT_CLIENT_MTU='1200'" "${STATE_DIR}/manager-awg1.env" || fail "awg1 client MTU default не сохранён"
 [[ -d "${STATE_DIR}/awg1/clients" ]] || fail "awg1 clients dir не создан"
 pass "Второй интерфейс создаётся рядом с первым"
 
-step "Тест nftables для двух интерфейсов append-only"
-NFT_BEFORE="${TMP_ROOT}/nftables.before"
-cp "$NFTABLES_CONF" "$NFT_BEFORE"
-NFT_BEFORE_SIZE="$(wc -c < "$NFT_BEFORE" | tr -d ' ')"
-printf '\n\nY\n' | run_in_env "${BUNDLE_ROOT}/scripts/03_setup_nftables.sh"
-head -c "$NFT_BEFORE_SIZE" "$NFTABLES_CONF" > "${TMP_ROOT}/nftables.prefix"
-cmp -s "$NFT_BEFORE" "${TMP_ROOT}/nftables.prefix" || fail "nftables.conf был изменён не append-only способом"
-grep -q 'elements = { 56789 }' "$NFTABLES_CONF" || fail "nftables потерял исходный UDP порт awg0"
-grep -q 'add element ip amneziawg_bundle vpn_ports { 443 }' "$NFTABLES_CONF" || fail "nftables не содержит append-команду для UDP порта awg1"
-grep -q 'add element ip amneziawg_bundle vpn_ifaces { "awg1" }' "$NFTABLES_CONF" || fail "nftables не содержит append-команду для awg1"
-pass "03_setup_nftables.sh учитывает несколько интерфейсов"
+step "Тест nftables для двух интерфейсов: аккуратное обновление существующего native firewall"
+cat > "$NFTABLES_CONF" <<'EOF_NFT_EXISTING'
+table inet filter {
+        chain input {
+                type filter hook input priority filter; policy drop;
+                iif "lo" accept
+                ct state established,related accept
+                tcp dport 22 accept
+                ip protocol icmp icmp type { echo-reply, destination-unreachable, echo-request, time-exceeded } accept
+                iifname "ens3" udp dport 56789 accept
+                iifname "ens3" udp dport { 53, 443 } accept
+                iifname "awg0" tcp dport 3000 accept
+        }
+
+        chain forward {
+                type filter hook forward priority filter; policy accept;
+        }
+
+        chain output {
+                type filter hook output priority filter; policy accept;
+        }
+}
+table inet nat {
+        chain postrouting {
+                type nat hook postrouting priority srcnat; policy accept;
+                iifname "awg0" oifname "ens3" masquerade
+        }
+
+        chain prerouting {
+                type nat hook prerouting priority dstnat; policy accept;
+                udp dport { 53, 443 } redirect to :56789
+        }
+}
+
+table ip amneziawg_bundle {
+        chain input {
+                type filter hook input priority 0; policy accept;
+                iifname "ens3" udp dport { 56789, 520 } accept
+        }
+}
+EOF_NFT_EXISTING
+printf '\n\n' | NFT_SAVE_CHANGES=yes NFT_APPLY_NOW=no run_in_env "${BUNDLE_ROOT}/scripts/03_setup_nftables.sh"
+grep -q 'iifname "ens3" udp dport { 56789, 520 } accept' "$NFTABLES_CONF" || fail "nftables не объединил UDP порты awg0/awg1"
+! grep -q 'iifname "ens3" udp dport 56789 accept' "$NFTABLES_CONF" || fail "Старое одиночное правило UDP 56789 не было убрано из candidate"
+grep -q 'iifname "ens3" udp dport { 53, 443 } accept' "$NFTABLES_CONF" || fail "Существующее правило 53/443 потеряно"
+grep -q 'udp dport { 53, 443 } redirect to :56789' "$NFTABLES_CONF" || fail "redirect 53/443 потерян"
+grep -q 'iifname { "awg0", "awg1" } oifname "ens3" masquerade' "$NFTABLES_CONF" || fail "nftables не объединил masquerade awg0/awg1"
+! grep -q '^table ip amneziawg_bundle' "$NFTABLES_CONF" || fail "Старый bundle table не был удалён из candidate"
+[[ "$(grep -c 'chain input' "$NFTABLES_CONF")" -eq 1 ]] || fail "Появилась лишняя input chain"
+find "${STATE_DIR}/backups" -type f -name 'nftables.conf' | grep -q . || fail "Не создан timestamp backup nftables.conf"
+pass "03_setup_nftables.sh обновляет существующий firewall без дублей и сохраняет redirect"
 
 step "Тест добавления клиента на awg1"
 run_in_env "${BUNDLE_ROOT}/scripts/04_add_client.sh" phone2 awg1
@@ -307,7 +352,8 @@ CLIENT_CONF_2="${STATE_DIR}/awg1/clients/phone2.conf"
 [[ -f "$CLIENT_CONF_2" ]] || fail "Клиент awg1 не создан"
 grep -q '^Address = 10.8.2.2/32$' "$CLIENT_CONF_2" || fail "Клиент awg1 получил неправильный IPv4"
 grep -q '^MTU = 1200$' "$CLIENT_CONF_2" || fail "Клиент awg1 не использует DEFAULT_CLIENT_MTU"
-grep -q '^AllowedIPs = 10.8.2.2/32$' "$SERVER_CONF_2" || fail "Peer awg1 не добавлен в правильный server.conf"
+grep -q '^# friendly_name=phone2$' "$SERVER_CONF_2" || fail "Peer awg1 не получил friendly_name"
+grep -q '^AllowedIPs = 10.8.2.2/32, fd42:42:43::2/128$' "$SERVER_CONF_2" || fail "Peer awg1 не добавлен с IPv4+IPv6 AllowedIPs"
 pass "04_add_client.sh добавляет клиента в выбранный интерфейс"
 
 step "Тест 05_update_amneziawg.sh append-only install.env"
