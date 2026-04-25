@@ -244,3 +244,21 @@ sudo INSTALL_GRAFANA=no ./install.sh --monitoring
 ```bash
 sudo CONFIGURE_NFTABLES=no ./install.sh --monitoring
 ```
+
+## Дополнение: all-mode wrapper для нескольких интерфейсов
+
+Начиная с обновления 2026-04-25 monitoring installer по умолчанию не передаёт exporter-у список интерфейсов через повторяющиеся `-i`. Вместо этого используется режим `wg show all dump` через wrapper `/usr/local/bin/wg`.
+
+Wrapper читает `/etc/wgexporter/monitoring.env`, берёт `WG_IFACES` и для каждого интерфейса вызывает `awg show <iface> dump`, добавляя имя интерфейса первым столбцом. Это делает multi-interface сбор метрик стабильнее для AmneziaWG.
+
+Рекомендуемый запуск:
+
+```bash
+sudo WG_IFACES="awg0 awg1 awg800" ./install.sh --monitoring
+```
+
+Аварийный явный режим, если он нужен для конкретной сборки exporter:
+
+```bash
+sudo EXPORTER_INTERFACE_MODE=explicit WG_IFACES="awg0 awg1 awg800" ./install.sh --monitoring
+```

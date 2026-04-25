@@ -153,3 +153,15 @@ README по скриптам
   RESTORE_CONFIRM=yes|no|ask
   RESTORE_APPLY_NFT=yes|no|ask
   RESTORE_RESTART_SERVICES=yes|no|ask
+
+Дополнение 2026-04-25
+---------------------
+
+`08_remove_client.sh` теперь поддерживает рекомендуемый интерактивный режим удаления по номеру:
+
+  sudo ./scripts/08_remove_client.sh --interactive
+  sudo ./scripts/08_remove_client.sh --interactive awg800
+
+Скрипт показывает клиентов выбранного интерфейса и удаляет выбранный peer по `PublicKey`. Старый режим `sudo ./scripts/08_remove_client.sh client_name awg0` оставлен для совместимости.
+
+`00_manage.sh`, `08_remove_client.sh`, `09_remove_interface.sh` и `11_setup_monitoring.sh` создают startup full backup до изменений. Это отдельный backup запуска, не заменяющий operation backup конкретного удаления/создания.

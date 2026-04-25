@@ -1,0 +1,8 @@
+AmneziaWG monitoring exporter CLI compatibility fix test
+Generated: 2026-04-25
+
+[PASS] bash -n scripts/11_setup_monitoring.sh
+[PASS] static check: script no longer generates repeated '-i iface -i iface' pattern
+[PASS] static check: ExecStart keeps one '-n /etc/wgexporter/peers.conf' and one '-i' followed by all selected interfaces
+
+Note: full integration tests were not rerun in this container because service/systemd/AWG runtime is unavailable here. The previous suite remains in tests/TEST_REPORT.txt.

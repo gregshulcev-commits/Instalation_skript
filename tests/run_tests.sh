@@ -380,12 +380,27 @@ run_in_env "${BUNDLE_ROOT}/scripts/05_update_amneziawg.sh"
 find "${STATE_DIR}/backups" -type f -name 'install.env' -exec grep -q '^# install env sentinel before update$' {} \; -print | grep -q . || fail "старый install.env не найден в backup"
 pass "05_update_amneziawg.sh выполняется на заглушках, перезаписывает install.env и сохраняет backup"
 
-step "Тест единого мастера --status"
+step "Тест единого мастера --status и startup full backup"
 run_in_env "${BUNDLE_ROOT}/scripts/00_manage.sh" --status > "${TMP_ROOT}/status.txt"
 grep -q 'Интерфейсы: 2' "${TMP_ROOT}/status.txt" || fail "00_manage --status не видит два интерфейса"
 grep -q 'awg0' "${TMP_ROOT}/status.txt" || fail "00_manage --status не показывает awg0"
 grep -q 'awg1' "${TMP_ROOT}/status.txt" || fail "00_manage --status не показывает awg1"
-pass "00_manage.sh сканирует существующую установку"
+find "${STATE_DIR}/backups" -maxdepth 1 -type d -name '*script-start-management*' | grep -q . || fail "00_manage не создал full backup при запуске"
+pass "00_manage.sh сканирует существующую установку и делает full backup при запуске"
+
+step "Тест удаления клиента по номеру без manager-<iface>.env"
+run_in_env "${BUNDLE_ROOT}/scripts/04_add_client.sh" numbered awg1
+NUMBERED_CONF="${STATE_DIR}/awg1/clients/numbered.conf"
+[[ -f "$NUMBERED_CONF" ]] || fail "Клиент numbered не создан"
+mv "${STATE_DIR}/manager-awg1.env" "${TMP_ROOT}/manager-awg1.env.saved"
+printf '2
+' | CONFIRM_REMOVE=yes run_in_env "${BUNDLE_ROOT}/scripts/08_remove_client.sh" --interactive awg1 > "${TMP_ROOT}/remove-numbered.txt"
+[[ ! -f "$NUMBERED_CONF" ]] || fail "client.conf numbered не удалён интерактивным выбором"
+! grep -q '^# friendly_name=numbered$' "$SERVER_CONF_2" || fail "Peer numbered не удалён по номеру"
+grep -q 'Выбран клиент #2: numbered' "${TMP_ROOT}/remove-numbered.txt" || fail "Интерактивное удаление не выбрало клиента numbered"
+rm -rf "${STATE_DIR}/manager-awg1.env"
+mv "${TMP_ROOT}/manager-awg1.env.saved" "${STATE_DIR}/manager-awg1.env"
+pass "08_remove_client.sh удаляет выбранного по номеру клиента и работает без manager-<iface>.env"
 
 step "Тест явного IPv6 клиента на awg0"
 CLIENT_ENABLE_IPV6=yes CLIENT_MTU=1280 run_in_env "${BUNDLE_ROOT}/scripts/04_add_client.sh" ipv6_phone awg0
@@ -446,6 +461,8 @@ assert 'awg_persistent_received_bytes_total' in expr
 assert 'awg_persistent_sent_bytes_total' in expr
 PY_DASH
 grep -q '/usr/local/bin/wg' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "monitoring installer должен использовать /usr/local/bin/wg wrapper"
+grep -q 'show all dump' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "monitoring installer должен поддерживать wg show all dump для multi-interface"
+grep -q 'EXPORTER_INTERFACE_MODE="${EXPORTER_INTERFACE_MODE:-all}"' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "По умолчанию exporter должен использовать all-mode"
 ! grep -q 'cat >.*/usr/bin/wg' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "monitoring installer не должен перезаписывать /usr/bin/wg"
 grep -q 'isDefault: false' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Grafana datasource не должен становиться default"
 grep -q 'disableDeletion: true' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Grafana provider должен включать disableDeletion"

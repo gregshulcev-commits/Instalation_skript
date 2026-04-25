@@ -30,6 +30,11 @@ done
 
 echo
 echo "== Exporter permission checks =="
+if sudo -u "$EXPORTER_USER" sudo -n /usr/local/bin/wg show all dump >/dev/null 2>&1; then
+  echo "all: sudo wg wrapper OK"
+else
+  echo "all: sudo wg wrapper FAIL"
+fi
 for iface in $WG_IFACES; do
   if sudo -u "$EXPORTER_USER" sudo -n /usr/local/bin/wg show "$iface" dump >/dev/null 2>&1; then
     echo "$iface: sudo wg wrapper OK"

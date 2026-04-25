@@ -69,6 +69,7 @@ main() {
     local requested_if selected_if vpn_if server_conf clients_dir keys_dir iface_env service_name listen_port backup_dir
 
     require_root
+    ensure_startup_full_backup "script-start-remove-interface"
     requested_if="${1:-${VPN_IF_OVERRIDE:-}}"
     selected_if="$(select_iface_interactive "$requested_if")"
     load_manager_env_for_iface "$selected_if"

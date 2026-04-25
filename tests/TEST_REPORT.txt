@@ -1,5 +1,5 @@
 AmneziaWG bundle test report
-Generated: 2026-04-25 11:06:53 UTC
+Generated: 2026-04-25 19:36:11 UTC
 
 == Подготовка окружения ==
 [PASS] Подготовлены fake sources и заглушки
@@ -37,8 +37,11 @@ Generated: 2026-04-25 11:06:53 UTC
 == Тест 05_update_amneziawg.sh атомарно перезаписывает install.env с backup ==
 [PASS] 05_update_amneziawg.sh выполняется на заглушках, перезаписывает install.env и сохраняет backup
 
-== Тест единого мастера --status ==
-[PASS] 00_manage.sh сканирует существующую установку
+== Тест единого мастера --status и startup full backup ==
+[PASS] 00_manage.sh сканирует существующую установку и делает full backup при запуске
+
+== Тест удаления клиента по номеру без manager-<iface>.env ==
+[PASS] 08_remove_client.sh удаляет выбранного по номеру клиента и работает без manager-<iface>.env
 
 == Тест явного IPv6 клиента на awg0 ==
 [PASS] 04_add_client.sh добавляет IPv6 /128 только при явном CLIENT_ENABLE_IPV6=yes

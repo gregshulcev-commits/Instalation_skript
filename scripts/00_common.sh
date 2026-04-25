@@ -176,6 +176,83 @@ backup_file() {
     fi
 }
 
+# Full infrastructure backup used at the start of management/install runs.
+# It intentionally skips ${STATE_DIR}/backups to avoid recursive backups.
+_backup_existing_paths_to_dir() {
+    local dir="$1"
+    shift || true
+    local path
+    for path in "$@"; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        backup_path_to_dir "$path" "$dir" >/dev/null
+    done
+}
+
+create_full_infrastructure_backup() {
+    local label="${1:-startup-full}"
+    local dir entry unit
+    dir="$(create_timestamped_backup_dir "$label")"
+    {
+        printf 'backup_type=full-infrastructure\n'
+        printf 'hostname=%s\n' "$(hostname 2>/dev/null || printf unknown)"
+        printf 'created_by=%s\n' "${0:-unknown}"
+        printf 'note=%s\n' 'Automatic backup before any management/install action. STATE_DIR/backups is excluded.'
+    } >> "${dir}/INFO"
+
+    if [[ -d "$STATE_DIR" ]]; then
+        shopt -s nullglob dotglob
+        for entry in "$STATE_DIR"/*; do
+            [[ "$(basename "$entry")" == "backups" ]] && continue
+            backup_path_to_dir "$entry" "$dir" >/dev/null
+        done
+        shopt -u nullglob dotglob
+    fi
+
+    _backup_existing_paths_to_dir "$dir" \
+        "$NFTABLES_CONF" \
+        "$SYSCTL_FILE" \
+        /etc/default/prometheus \
+        /etc/prometheus/prometheus.yml \
+        /etc/grafana/grafana.ini \
+        /etc/grafana/provisioning/datasources/awg-monitoring-prometheus.yml \
+        /etc/grafana/provisioning/dashboards/awg-monitoring.yml \
+        /var/lib/grafana/dashboards/awg-managed \
+        /etc/wgexporter \
+        /etc/sudoers.d/wgexporter \
+        /usr/local/bin/wg \
+        /usr/local/bin/prometheus_wireguard_exporter \
+        /usr/local/sbin/awg-exporter-sync-peers \
+        /usr/local/sbin/awg-persistent-traffic-exporter \
+        /usr/local/sbin/check-awg-monitoring
+
+    shopt -s nullglob
+    for unit in \
+        /etc/systemd/system/awg-quick@.service \
+        /etc/systemd/system/wgexporter.service \
+        /etc/systemd/system/awg-persistent-traffic.service; do
+        [[ -e "$unit" ]] && backup_path_to_dir "$unit" "$dir" >/dev/null
+    done
+    shopt -u nullglob
+
+    printf '%s\n' "$dir"
+}
+
+ensure_startup_full_backup() {
+    local label="${1:-startup-full}"
+    local dir
+    if [[ "${AWG_DISABLE_STARTUP_BACKUP:-no}" == "yes" ]]; then
+        warn "Startup full backup disabled by AWG_DISABLE_STARTUP_BACKUP=yes"
+        return 0
+    fi
+    if [[ "${AWG_STARTUP_BACKUP_DONE:-no}" == "yes" ]]; then
+        return 0
+    fi
+    dir="$(create_full_infrastructure_backup "$label")"
+    export AWG_STARTUP_BACKUP_DONE=yes
+    export AWG_STARTUP_BACKUP_DIR="$dir"
+    ok "Full backup перед запуском: $dir"
+}
+
 restore_backup_dir() {
     local dir="$1"
     local manifest="${dir}/MANIFEST.tsv"
@@ -701,7 +778,7 @@ client_exists_in_conf() {
     local conf="$1"
     local name="$2"
     [[ -f "$conf" ]] || return 1
-    grep -Eq "^(### Client ${name}|#[[:space:]]*friendly_name=${name})$" "$conf"
+    grep -Eq "^([[:space:]]*### Client ${name}|[[:space:]]*#[[:space:]]*friendly_name[[:space:]]*=[[:space:]]*${name})[[:space:]]*$" "$conf"
 }
 
 next_free_ipv4() {
@@ -846,13 +923,30 @@ write_manager_env_for_iface() {
     write_manager_env "$pointer_file" "$vpn_if" "$server_conf" "$clients_dir" "$keys_dir" "$endpoint_host" "$endpoint_port" "$service_name" "$awg_bin" "$awg_quick_bin" "$dns_servers" "$external_if" "$ssh_port" "$default_client_mtu" "$server_enable_ipv6"
 }
 
+derive_minimal_env_for_iface() {
+    local vpn_if="$1"
+    VPN_IF="$vpn_if"
+    SERVER_CONF="$(server_conf_for_iface "$vpn_if")"
+    CLIENTS_DIR="$(clients_dir_for_iface "$vpn_if")"
+    KEYS_DIR="$(keys_dir_for_iface "$vpn_if")"
+    SERVICE_NAME="awg-quick@${vpn_if}.service"
+    AWG_BIN="$(detect_awg_bin)"
+    AWG_QUICK_BIN="$(detect_awg_quick_bin)"
+}
+
 load_manager_env_for_iface() {
     local requested_if="${1:-}"
     local iface_env
     if [[ -n "$requested_if" ]]; then
         iface_env="$(manager_env_for_iface "$requested_if")"
-        [[ -f "$iface_env" ]] || die "Не найден файл настроек интерфейса: $iface_env"
-        source_env_if_exists "$iface_env"
+        if [[ -f "$iface_env" ]]; then
+            source_env_if_exists "$iface_env"
+        elif [[ -f "$(server_conf_for_iface "$requested_if")" ]]; then
+            warn "Файл настроек интерфейса не найден: $iface_env; использую безопасные значения из имени интерфейса и server.conf"
+            derive_minimal_env_for_iface "$requested_if"
+        else
+            die "Не найден ни файл настроек интерфейса, ни server.conf: $iface_env / $(server_conf_for_iface "$requested_if")"
+        fi
     else
         source_env_if_exists "$MANAGER_ENV_FILE"
     fi
@@ -962,6 +1056,93 @@ count_clients_for_iface() {
         by_files="$(find "$clients_dir" -maxdepth 1 -type f -name '*.conf' | wc -l | tr -d ' ')"
     fi
     printf '%s/%s\n' "$by_conf" "$by_files"
+}
+
+
+list_clients_for_iface_tsv() {
+    local iface="$1"
+    local conf
+    conf="$(server_conf_for_iface "$iface")"
+    [[ -f "$conf" ]] || die "Не найден server.conf: $conf"
+    python3 -S - "$conf" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+conf = Path(sys.argv[1])
+lines = conf.read_text(encoding='utf-8', errors='replace').splitlines()
+peers = []
+pending_legacy = ''
+current = None
+
+def finish(peer):
+    if not peer:
+        return
+    idx = len(peers) + 1
+    name = peer.get('friendly') or peer.get('legacy') or f'peer_{idx}'
+    public = peer.get('public_key', '')
+    allowed = peer.get('allowed_ips', '')
+    peers.append((idx, name, public, allowed))
+
+for raw in lines:
+    stripped = raw.strip()
+    m = re.match(r'^###\s*Client\s+(.+?)\s*$', stripped)
+    if m:
+        pending_legacy = m.group(1).strip()
+        if current is not None and not current.get('legacy'):
+            current['legacy'] = pending_legacy
+        continue
+    if stripped == '[Peer]':
+        finish(current)
+        current = {'legacy': pending_legacy}
+        pending_legacy = ''
+        continue
+    if current is None:
+        continue
+    m = re.match(r'^#\s*friendly_name\s*=\s*(.+?)\s*$', stripped)
+    if m:
+        current['friendly'] = m.group(1).strip()
+        continue
+    m = re.match(r'^PublicKey\s*=\s*(.+?)\s*$', stripped)
+    if m:
+        current['public_key'] = m.group(1).strip()
+        continue
+    m = re.match(r'^AllowedIPs\s*=\s*(.+?)\s*$', stripped)
+    if m:
+        current['allowed_ips'] = m.group(1).strip()
+        continue
+finish(current)
+for idx, name, public, allowed in peers:
+    safe = lambda s: str(s).replace('\t', ' ').replace('\n', ' ').strip()
+    print(f"{idx}\t{safe(name)}\t{safe(public)}\t{safe(allowed)}")
+PY
+}
+
+select_client_interactive() {
+    local iface="$1"
+    local clients count choice line idx name public allowed
+    mapfile -t clients < <(list_clients_for_iface_tsv "$iface")
+    count="${#clients[@]}"
+    if (( count == 0 )); then
+        die "В интерфейсе ${iface} не найдено клиентов ([Peer] блоков)."
+    fi
+    printf 'Доступные клиенты в %s:\n' "$iface" >&2
+    for line in "${clients[@]}"; do
+        IFS=$'\t' read -r idx name public allowed <<<"$line"
+        [[ -n "$name" ]] || name="peer_${idx}"
+        [[ -n "$public" ]] || public="NO_PUBLIC_KEY"
+        [[ -n "$allowed" ]] || allowed="NO_ALLOWED_IPS"
+        printf '  %s) %-24s %-24s %.16s...\n' "$idx" "$name" "$allowed" "$public" >&2
+    done
+    while true; do
+        read -r -p "Выберите клиента [1]: " choice || choice=""
+        choice="${choice:-1}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
+            printf '%s\n' "${clients[$((choice - 1))]}"
+            return 0
+        fi
+        warn "Введите номер от 1 до ${count}"
+    done
 }
 
 strip_cr() {

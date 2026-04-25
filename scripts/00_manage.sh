@@ -197,10 +197,9 @@ add_client_flow() {
 }
 
 remove_client_flow() {
-    local iface client_name
+    local iface
     iface="$(select_iface_interactive "")"
-    client_name="$(prompt_default "Имя клиента для удаления" "client1")"
-    "${SCRIPT_DIR}/08_remove_client.sh" "$client_name" "$iface"
+    "${SCRIPT_DIR}/08_remove_client.sh" --interactive "$iface"
 }
 
 remove_interface_flow() {
@@ -284,6 +283,9 @@ main() {
     require_root
     case "${1:-}" in
         --help|-h) usage; exit 0 ;;
+    esac
+    ensure_startup_full_backup "script-start-management"
+    case "${1:-}" in
         --status) status_report; exit 0 ;;
         --monitoring) setup_monitoring_flow; exit 0 ;;
         --monitoring-status) monitoring_status_report; exit 0 ;;

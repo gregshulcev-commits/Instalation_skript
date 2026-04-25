@@ -259,3 +259,13 @@ Monitoring add-on, 2026-04-25
 - пользовательские dashboards не удаляются;
 - persistent traffic totals хранятся в /var/lib/wgexporter/traffic_totals.json;
 - /usr/bin/wg не перезаписывается, wrapper ставится в /usr/local/bin/wg.
+
+Дополнение 2026-04-25: удаление по номеру и обязательный startup backup
+-----------------------------------------------------------------------
+
+- При запуске `sudo ./install.sh` или `sudo ./scripts/00_manage.sh` автоматически создаётся full backup текущей инфраструктуры в `/etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-script-start-management/`.
+- Удаление клиента через меню теперь работает по номеру: сначала выбирается интерфейс, затем клиент внутри интерфейса. Фактическое удаление выполняется по `PublicKey`, поэтому одинаковые `friendly_name` на разных интерфейсах не мешают.
+- Если `manager-awg0.env` или другой `manager-<iface>.env` отсутствует, скрипты удаления используют fallback из `<iface>.conf` и больше не падают с ошибкой отсутствующего env-файла.
+- Monitoring exporter по умолчанию использует wrapper `/usr/local/bin/wg` в режиме `wg show all dump`, чтобы собирать peer-метрики со всех выбранных интерфейсов.
+
+Подробности: `docs/UPDATE_20260425_REMOVE_BACKUP_MONITORING_RU.md`.

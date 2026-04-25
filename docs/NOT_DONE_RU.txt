@@ -78,3 +78,28 @@ Monitoring add-on: что не удалось проверить в контей
    контейнере. Скрипт оставляет проверку версий/наличия и собирает exporter
    на сервере только если бинарник отсутствует, не поддерживает нужные флаги
    или задано UPDATE_EXPORTER=yes.
+
+Дополнение 2026-04-25 после правок удаления/monitoring
+------------------------------------------------------
+
+Автоматически проверено в тестовой среде:
+- bash-синтаксис всех shell-скриптов;
+- удаление клиента по номеру через `08_remove_client.sh --interactive`;
+- удаление клиента при отсутствующем `manager-<iface>.env` с fallback на `<iface>.conf`;
+- создание startup full backup при запуске `00_manage.sh --status`;
+- прежние сценарии удаления клиента/интерфейса и restore;
+- static-check monitoring all-mode (`wg show all dump`).
+
+Не проверено на реальном VPS в рамках контейнера:
+- фактический restart `wgexporter.service` в all-mode на вашем сервере;
+- фактический вывод `/usr/local/bin/wg show all dump` через sudoers после переустановки;
+- применение production nftables ruleset;
+- отображение обновлённого dashboard в Grafana UI.
+
+Рекомендуемая проверка на сервере после установки архива:
+
+  sudo ./install.sh --monitoring
+  sudo /usr/local/sbin/check-awg-monitoring
+  sudo -u wgexporter sudo -n /usr/local/bin/wg show all dump | grep awg800
+  curl -s http://127.0.0.1:9586/metrics | grep awg800
+  curl -s http://127.0.0.1:9587/metrics | grep awg800

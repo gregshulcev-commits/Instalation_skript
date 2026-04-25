@@ -36,6 +36,7 @@ CONFIGURE_NFTABLES="${CONFIGURE_NFTABLES:-yes}"
 UPDATE_EXPORTER="${UPDATE_EXPORTER:-no}"
 MANAGE_EXISTING_GRAFANA_INI="${MANAGE_EXISTING_GRAFANA_INI:-no}"
 PROMETHEUS_BIND_LOCALHOST="${PROMETHEUS_BIND_LOCALHOST:-yes}"
+EXPORTER_INTERFACE_MODE="${EXPORTER_INTERFACE_MODE:-all}"  # all|explicit
 
 AWG_MONITORING_BACKUP_DIR=""
 MONITOR_IFACES=()
@@ -67,6 +68,7 @@ Important environment variables:
   CONFIGURE_NFTABLES=yes|no           Restrict Grafana port to AWG interfaces.
   UPDATE_EXPORTER=no|yes              Rebuild exporter even if binary exists.
   MANAGE_EXISTING_GRAFANA_INI=no|yes  Patch grafana.ini even if Grafana already existed.
+  EXPORTER_INTERFACE_MODE=all|explicit Default all uses wg show all dump via wrapper.
 
 Managed files:
   /etc/systemd/system/wgexporter.service
@@ -358,6 +360,7 @@ PROMETHEUS_PORT="${PROMETHEUS_PORT}"
 GRAFANA_PORT="${GRAFANA_PORT}"
 WGEXPORTER_PEERS_FILE="${WGEXPORTER_PEERS_FILE}"
 WGEXPORTER_STATE_DIR="${WGEXPORTER_STATE_DIR}"
+EXPORTER_INTERFACE_MODE="${EXPORTER_INTERFACE_MODE}"
 ENV_EOF
     chown root:"$EXPORTER_USER" "$WGEXPORTER_ENV_FILE"
     chmod 0640 "$WGEXPORTER_ENV_FILE"
@@ -380,9 +383,13 @@ install_awg_wrapper() {
     cat >"$wrapper" <<'WRAPPER_EOF'
 #!/bin/sh
 # AWG_PROMETHEUS_EXPORTER_WRAPPER
-# prometheus_wireguard_exporter calls: wg show <interface> dump
-# On AmneziaWG servers we need:         awg show <interface> dump
+# prometheus_wireguard_exporter calls either:
+#   wg show all dump
+# or:
+#   wg show <interface> dump
+# On AmneziaWG servers we translate these calls to awg.
 AWG_BIN="${AWG_BIN:-/usr/bin/awg}"
+ENV_FILE="${WGEXPORTER_ENV_FILE:-/etc/wgexporter/monitoring.env}"
 if [ ! -x "$AWG_BIN" ]; then
   AWG_BIN="$(command -v awg 2>/dev/null || true)"
 fi
@@ -390,20 +397,46 @@ if [ -z "$AWG_BIN" ]; then
   echo "awg binary not found" >&2
   exit 127
 fi
-if [ "${1:-}" = "show" ] && [ "${3:-}" = "dump" ] && [ "$#" -eq 3 ]; then
-  "$AWG_BIN" show "$2" dump | awk '
-    NR==1 { print $1 "\t" $2 "\t" $3 "\t" $4; next }
-    { print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8 }
-  '
-else
-  exec "$AWG_BIN" "$@"
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$ENV_FILE" 2>/dev/null || true
 fi
+IFACES="${WG_IFACES:-}"
+if [ -z "$IFACES" ]; then
+  IFACES="$($AWG_BIN show interfaces 2>/dev/null || true)"
+fi
+if [ -z "$IFACES" ]; then
+  for conf in /etc/amnezia/amneziawg/*.conf; do
+    [ -e "$conf" ] || continue
+    base="$(basename "$conf" .conf)"
+    IFACES="$IFACES $base"
+  done
+fi
+
+if [ "${1:-}" = "show" ] && [ "${2:-}" = "interfaces" ] && [ "$#" -eq 2 ]; then
+  printf '%s\n' $IFACES
+  exit 0
+fi
+
+if [ "${1:-}" = "show" ] && [ "${2:-}" = "all" ] && [ "${3:-}" = "dump" ] && [ "$#" -eq 3 ]; then
+  for iface in $IFACES; do
+    "$AWG_BIN" show "$iface" dump 2>/dev/null | awk -v iface="$iface" 'NF { print iface "\t" $0 }'
+  done
+  exit 0
+fi
+
+if [ "${1:-}" = "show" ] && [ "${3:-}" = "dump" ] && [ "$#" -eq 3 ]; then
+  exec "$AWG_BIN" show "$2" dump
+fi
+
+exec "$AWG_BIN" "$@"
 WRAPPER_EOF
     chmod 0755 "$wrapper"
     local iface
     for iface in "${MONITOR_IFACES[@]}"; do
         "$wrapper" show "$iface" dump >/dev/null
     done
+    "$wrapper" show all dump >/dev/null
 }
 
 install_sudoers_rule() {
@@ -413,17 +446,16 @@ install_sudoers_rule() {
     {
         echo "Defaults:${EXPORTER_USER} !requiretty"
         echo "Defaults:${EXPORTER_USER} secure_path=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
-        printf '%s ALL=(root) NOPASSWD: ' "$EXPORTER_USER"
-        local first=1 iface
+        printf '%s ALL=(root) NOPASSWD: /usr/local/bin/wg show all dump' "$EXPORTER_USER"
+        local iface
         for iface in "${MONITOR_IFACES[@]}"; do
-            if [[ "$first" -eq 0 ]]; then printf ', '; fi
-            printf '/usr/local/bin/wg show %s dump' "$iface"
-            first=0
+            printf ', /usr/local/bin/wg show %s dump' "$iface"
         done
         printf '\n'
     } >"$sudoers"
     chmod 0440 "$sudoers"
     visudo -cf "$sudoers"
+    sudo -u "$EXPORTER_USER" sudo -n /usr/local/bin/wg show all dump >/dev/null
     local iface
     for iface in "${MONITOR_IFACES[@]}"; do
         sudo -u "$EXPORTER_USER" sudo -n /usr/local/bin/wg show "$iface" dump >/dev/null
@@ -433,9 +465,18 @@ install_sudoers_rule() {
 install_exporter_service() {
     mon_log "Installing raw exporter systemd service"
     local iface_args="" iface config_args="" conf
-    for iface in "${MONITOR_IFACES[@]}"; do
-        iface_args+=" -i ${iface}"
-    done
+    if [[ "$EXPORTER_INTERFACE_MODE" == "explicit" ]]; then
+        # Some old/current exporter builds reject repeated -i; pass one -i followed by all interfaces.
+        iface_args=" -i"
+        for iface in "${MONITOR_IFACES[@]}"; do
+            iface_args+=" ${iface}"
+        done
+    elif [[ "$EXPORTER_INTERFACE_MODE" == "all" ]]; then
+        # Default: no -i. The exporter asks wg show all dump, and our wrapper expands all selected AWG interfaces.
+        iface_args=""
+    else
+        mon_fail "Unsupported EXPORTER_INTERFACE_MODE=${EXPORTER_INTERFACE_MODE}; use all or explicit"
+    fi
     for conf in "${MONITOR_CONFS[@]}"; do
         config_args+=" ${conf}"
     done
@@ -799,6 +840,7 @@ main() {
         --status) monitoring_status; exit 0 ;;
     esac
     require_root
+    ensure_startup_full_backup "script-start-monitoring"
     print_versions
     detect_interfaces
     install_packages_if_needed
