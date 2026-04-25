@@ -1,0 +1,50 @@
+Что не удалось проверить полностью
+==================================
+
+1. Реальный `awg-quick up awg800` на вашем VPS не запускался из контейнера.
+   Причина: контейнер не имеет вашего ядра, DKMS-модуля AmneziaWG, systemd runtime, сетевых интерфейсов и реального nftables ruleset сервера.
+
+2. Реальная DKMS-сборка против ядра вашего VPS не выполнялась.
+   В tests/run_tests.sh используются fake sources и заглушки команд awg/awg-quick/systemctl/nft/dkms.
+
+3. Я не вкладывал реальные upstream tar.gz исходников AmneziaWG в архив.
+   Для офлайн-режима используйте:
+
+     ./sources/download_upstream_sources.sh
+
+   Затем перенесите заполненную папку sources/ на целевой сервер.
+
+Что проверено автоматически
+===========================
+
+- bash -n всех shell-скриптов;
+- fake install из локальных sources;
+- создание awg0;
+- nftables для одного интерфейса;
+- IPv4-only клиент по умолчанию;
+- отказ от перезаписи существующего интерфейса;
+- создание awg1 со следующей подсетью;
+- nftables для двух интерфейсов без дублей;
+- добавление клиента в awg1;
+- update с backup install.env;
+- 00_manage.sh --status;
+- явный IPv6-клиент через CLIENT_ENABLE_IPV6=yes;
+- удаление клиента и восстановление из backup;
+- удаление интерфейса, очистка nftables и восстановление из backup.
+
+Главное, что нужно проверить на сервере
+=======================================
+
+1. Скопировать архив на VPS и распаковать.
+2. Запустить:
+
+     sudo ./scripts/00_manage.sh --status
+
+3. Создать тестовый интерфейс или применить к существующему после ручного backup.
+4. Проверить:
+
+     sudo awg-quick up /etc/amnezia/amneziawg/<iface>.conf
+     sudo journalctl -u awg-quick@<iface>.service -n 100 --no-pager
+     sudo nft -c -f /etc/nftables.conf
+
+5. Если используется старый server.conf с IPv6 /128 в peer AllowedIPs и MTU ниже 1280, убрать IPv6 /128 из peer или поднять MTU до 1280+.

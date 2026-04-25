@@ -1,173 +1,155 @@
 CONFIG_GUIDE
 ============
 
-Как устроены конфиги
---------------------
-Каждый интерфейс имеет отдельный серверный конфиг:
+Файлы состояния
+---------------
 
-  /etc/amnezia/amneziawg/awg0.conf
-  /etc/amnezia/amneziawg/awg1.conf
+  /etc/amnezia/amneziawg/install.env
+    Пути к awg, awg-quick, cache/source и sysctl. Перезаписывается атомарно с backup.
 
-Каждый .conf содержит свой [Interface]:
-
-  PrivateKey
-  Address IPv4
-  Address IPv6 ULA
-  ListenPort
-  MTU
-  Jc/Jmin/Jmax/S1/S2/H1/H2/H3/H4
-
-Клиенты добавляются ниже в Grafana-friendly формате:
-
-  [Peer]
-  # friendly_name=phone
-  PublicKey = ...
-  PresharedKey = ...
-  AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
-
-IPv6 /128 в server.conf добавляется всегда, чтобы адрес был закреплён за peer и был виден мониторингу. В client.conf IPv6 Address по умолчанию остаётся закомментированным, пока вы явно не включите IPv6-маршрутизацию.
-
-Подсети
--------
-Автоматическая выдача IPv4 сейчас рассчитана на /24. Поэтому используйте разные /24 для разных интерфейсов:
-
-  awg0 -> 10.8.1.1/24
-  awg1 -> 10.8.2.1/24
-  awg2 -> 10.8.3.1/24
-
-Не используйте одну и ту же подсеть на двух интерфейсах.
-
-IPv6 ULA тоже должна отличаться:
-
-  awg0 -> fd42:42:42::1/64
-  awg1 -> fd42:42:43::1/64
-  awg2 -> fd42:42:44::1/64
-
-MTU
----
-В bundle разделены два значения:
-
-1. Server MTU
-   Записывается в server .conf:
-
-     MTU = 1280
-
-2. Default client MTU
-   Записывается в manager-<iface>.env:
-
-     DEFAULT_CLIENT_MTU='1280'
-
-При добавлении клиента это значение предлагается по умолчанию и попадает в client.conf:
-
-  MTU = 1280
-
-Для проблемных мобильных сетей безопасный первый тест:
-
-  server MTU = 1280
-  client MTU = 1280
-
-Если нужно проверить экстремальный вариант:
-
-  server MTU = 1280
-  client MTU = 1200
-
-Но MTU ниже 1280 лучше использовать только для IPv4-only клиентов.
-
-AWG параметры
--------------
-При создании каждого интерфейса задаются:
-
-  Jc
-  Jmin
-  Jmax
-  S1
-  S2
-  H1
-  H2
-  H3
-  H4
-
-Эти параметры копируются из server.conf в каждый client.conf при добавлении клиента.
-
-Важно: параметры клиента должны совпадать с параметрами интерфейса сервера. Если вы изменили Jc/Jmin/Jmax/S1/S2/H1-H4 в server.conf вручную, пересоздайте клиентский конфиг или поправьте его вручную.
-
-manager env
------------
-Для каждого интерфейса создаётся:
+  /etc/amnezia/amneziawg/manager.env
+    Указатель на последний/активный интерфейс для совместимости. Перезаписывается атомарно с backup.
 
   /etc/amnezia/amneziawg/manager-awg0.env
   /etc/amnezia/amneziawg/manager-awg1.env
+    Настройки конкретного интерфейса: SERVER_CONF, CLIENTS_DIR, KEYS_DIR, ENDPOINT_HOST, ENDPOINT_PORT, DEFAULT_CLIENT_MTU, SERVER_ENABLE_IPV6.
 
-Там лежат:
-- SERVER_CONF;
-- CLIENTS_DIR;
-- KEYS_DIR;
-- VPN_IF;
-- SERVICE_NAME;
-- ENDPOINT_HOST;
-- ENDPOINT_PORT;
-- DNS_SERVERS;
-- DEFAULT_CLIENT_MTU.
+  /etc/amnezia/amneziawg/firewall.env
+    Последние EXTERNAL_IF, SSH_PORT, список AWG_PORTS и AWG_IFACES. Нужен для чистки старых nftables-правил при удалении интерфейса.
 
-Файл manager.env — это только совместимый указатель на последний созданный/изменённый интерфейс. Он обновляется append-only: старые блоки остаются, а shell source использует последние значения. При нескольких интерфейсах лучше всегда указывать имя интерфейса явно:
+  /etc/amnezia/amneziawg/awg0.conf
+  /etc/amnezia/amneziawg/awg1.conf
+    Серверные конфиги интерфейсов.
 
-  sudo ./scripts/04_add_client.sh phone awg1
+  /etc/amnezia/amneziawg/clients/
+  /etc/amnezia/amneziawg/keys/
+    Совместимый layout для awg0.
 
-или пользоваться главным меню:
+  /etc/amnezia/amneziawg/awg1/clients/
+  /etc/amnezia/amneziawg/awg1/keys/
+    Layout для второго и последующих интерфейсов.
 
-  sudo ./install.sh
+Backup layout
+-------------
+Каждая операция создаёт папку вида:
 
-Безопасное добавление интерфейса
---------------------------------
-Правильная последовательность:
+  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-label/
 
-  sudo ./install.sh
-  -> 3) Создать новый интерфейс AWG
-  -> задать новую подсеть и порт
-  -> согласиться обновить nftables/NAT
-  -> при желании добавить клиента
+Внутри:
 
-Скрипт не перезаписывает старые .conf. Если указать уже существующее имя интерфейса, операция будет остановлена, даже если задана совместимая переменная OVERWRITE_EXISTING_IFACE=yes. Для изменений старого интерфейса добавляйте клиента через 04_add_client.sh или редактируйте вручную после отдельного backup.
+  INFO
+    label и время создания.
 
-Append-only и backup
+  MANIFEST.tsv
+    Список старых файлов/директорий, которые были сохранены перед изменением.
+
+  CREATED_PATHS
+    Список новых путей, которые нужно удалить при rollback/restore. Есть не во всех backup.
+
+  files/...
+    Копии старых файлов с сохранением абсолютного пути внутри backup.
+
+Откат:
+
+  sudo ./scripts/10_restore_backup.sh /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-label
+
+Перед restore создаётся отдельный pre-restore backup текущего состояния.
+
+MTU и IPv6
+----------
+IPv6 требует MTU не ниже 1280. Поэтому:
+
+- при создании серверного интерфейса с IPv6 server MTU < 1280 запрещён;
+- при добавлении клиента с CLIENT_ENABLE_IPV6=yes client MTU < 1280 запрещён;
+- по умолчанию новые клиенты IPv4-only, чтобы awg-quick не добавлял IPv6 /128 route.
+
+Рекомендуемые стартовые значения:
+
+  SERVER_MTU_DEFAULT=1280
+  CLIENT_MTU_DEFAULT=1280
+
+Для IPv4-only тестов в сложных мобильных сетях можно пробовать client MTU 1200, но не включайте для такого клиента IPv6.
+
+Obfuscation параметры
+---------------------
+Jc:
+  Количество junk-пакетов/итераций обфускации. Больше значение = больше шума и накладных расходов.
+
+Jmin:
+  Минимальный размер junk-пакета.
+
+Jmax:
+  Максимальный размер junk-пакета. Должен быть >= Jmin.
+
+S1/S2:
+  Размеры служебных obfuscation-пакетов/сигнатур. Обычно оставляют defaults.
+
+H1-H4:
+  32-bit magic/header значения. Клиент и сервер должны иметь одинаковые значения.
+
+Если нет конкретной причины менять параметры, оставляйте defaults.
+
+Подсети по умолчанию
 --------------------
-При добавлении клиента server.conf только дополняется новым [Peer] в конце файла. Перед append создаётся timestamp-backup в отдельной папке:
+Если уже существует:
 
-  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-server-conf-awg0/awg0.conf
-  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-server-conf-awg1/awg1.conf
+  awg0: 10.8.1.1/24
 
-При изменении существующего nftables.conf создаётся backup:
+следующий интерфейс получит default:
 
-  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-nftables/nftables.conf
+  awg1: 10.8.2.1/24
 
-Автоматический rollback отключён: восстановление backup поверх server.conf было бы перезаписью старого файла. Если перезапуск сервиса не удался, backup остаётся рядом, а решение об откате принимает администратор вручную.
+IPv6 default считается синхронно:
 
-nftables native update
-----------------------
-03_setup_nftables.sh больше не добавляет отдельную table ip amneziawg_bundle рядом с вашим рабочим firewall, если уже найдены table inet filter и table inet nat.
+  10.8.1.1/24 -> fd42:42:42::1/64
+  10.8.2.1/24 -> fd42:42:43::1/64
+  10.8.3.1/24 -> fd42:42:44::1/64
 
-Для существующего native firewall он пытается сделать ровно такие изменения:
+nftables модель
+---------------
+03_setup_nftables.sh строит итоговый /etc/nftables.conf для всех AWG интерфейсов. Файл начинается с:
 
-  iifname "ens3" udp dport 56789 accept
+  flush ruleset
 
-заменить на:
+Это сделано, чтобы при `nft -f /etc/nftables.conf` runtime ruleset заменялся целиком, а старые правила не наслаивались поверх новых.
+
+Для нескольких интерфейсов важные строки выглядят так:
 
   iifname "ens3" udp dport { 56789, 520 } accept
-
-и:
-
-  iifname "awg0" oifname "ens3" masquerade
-
-заменить на:
-
   iifname { "awg0", "awg1" } oifname "ens3" masquerade
 
-Существующие redirect/DNAT строки, например:
+При удалении интерфейса скрипт использует firewall.env и параметры EXTRA_AWG_PORTS_TO_REMOVE / EXTRA_AWG_IFACES_TO_REMOVE, чтобы убрать старые allow/NAT правила.
 
-  udp dport { 53, 443 } redirect to :56789
+Неинтерактивные примеры
+-----------------------
+Создать awg1:
 
-сохраняются. Если структура nftables непонятна, скрипт не меняет файл и печатает ручные инструкции.
+  sudo VPN_IF_DEFAULT=awg1 \
+       LISTEN_PORT_DEFAULT=520 \
+       SERVER_ADDR_V4_DEFAULT=10.8.2.1/24 \
+       SERVER_ADDR_V6_DEFAULT=fd42:42:43::1/64 \
+       ENDPOINT_HOST_DEFAULT=203.0.113.10 \
+       SERVER_MTU_DEFAULT=1280 \
+       CLIENT_MTU_DEFAULT=1280 \
+       ./scripts/02_create_server_config.sh
 
-Установка awg-tools
--------------------
-При реальной сборке 01_install_from_source.sh устанавливает awg-tools в новый каталог TOOLS_INSTALL_ROOT. Если базовый каталог уже существует, выбирается свободный путь с суффиксом timestamp/PID. Пути к awg и awg-quick сохраняются в install.env, а systemd unit получает PATH с каталогом установленного awg-quick, чтобы не требовать перезаписи старых системных бинарников.
+Добавить IPv4-only клиента:
+
+  sudo CLIENT_MTU=1280 QR_OUTPUT=no ./scripts/04_add_client.sh phone awg1
+
+Добавить IPv6-клиента:
+
+  sudo CLIENT_ENABLE_IPV6=yes CLIENT_MTU=1280 ./scripts/04_add_client.sh phone6 awg1
+
+Удалить клиента:
+
+  sudo ./scripts/08_remove_client.sh phone awg1
+
+Удалить интерфейс без немедленного применения nftables:
+
+  sudo CONFIRM_REMOVE=yes NFT_SAVE_CHANGES=yes NFT_APPLY_NOW=no ./scripts/09_remove_interface.sh awg1
+
+Восстановить backup без применения firewall и без restart:
+
+  sudo RESTORE_CONFIRM=yes RESTORE_APPLY_NFT=no RESTORE_RESTART_SERVICES=no \
+       ./scripts/10_restore_backup.sh /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-label

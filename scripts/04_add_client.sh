@@ -13,7 +13,7 @@ CLIENT_ENABLE_IPV6_WAS_SET="${CLIENT_ENABLE_IPV6+x}"
 CLIENT_ENABLE_IPV6="${CLIENT_ENABLE_IPV6:-no}"
 PERSISTENT_KEEPALIVE="${PERSISTENT_KEEPALIVE:-25}"
 QR_OUTPUT="${QR_OUTPUT:-yes}"
-ROLLBACK_ON_RESTART_FAIL="${ROLLBACK_ON_RESTART_FAIL:-no}"
+ROLLBACK_ON_RESTART_FAIL="${ROLLBACK_ON_RESTART_FAIL:-yes}"
 
 usage() {
     cat <<'EOF_USAGE'
@@ -22,32 +22,21 @@ usage() {
 Добавляет клиента в выбранный интерфейс AmneziaWG.
 Если interface не указан и интерфейсов несколько, скрипт предложит выбрать нужный.
 
-Что делает:
-  - читает manager-<interface>.env;
-  - генерирует ключи клиента и PresharedKey;
-  - выбирает следующий свободный IPv4 внутри /24 подсети интерфейса;
-  - резервирует IPv6 /128 на сервере;
-  - спрашивает/использует MTU клиента;
-  - добавляет [Peer] в server.conf в Grafana-friendly формате;
-  - создаёт готовый client.conf;
-  - перезапускает только awg-quick@<iface>.service.
-
-Формат server.conf для клиента:
-
-  [Peer]
-  # friendly_name=<client_name>
-  PublicKey = ...
-  PresharedKey = ...
-  AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
+Что исправлено в этой версии:
+  - по умолчанию клиент и server peer получают только IPv4 AllowedIPs;
+  - IPv6 /128 добавляется в server.conf только при CLIENT_ENABLE_IPV6=yes;
+  - это убирает типичный сбой awg-quick на строке `ip -6 route add ... dev awgN` для IPv4-only клиентов;
+  - если IPv6 включается для клиента, MTU должен быть не ниже 1280;
+  - перед изменением server.conf создаётся timestamp-backup с MANIFEST.tsv;
+  - при Ctrl+C/ошибке или неудачном restart по умолчанию выполняется автоматический rollback.
 
 Переменные:
-  CLIENT_MTU=1280                  - MTU в клиентском конфиге без вопроса
-  CLIENT_ENABLE_IPV6=yes|no        - раскомментировать IPv6 Address и добавить ::/0 в client AllowedIPs. По умолчанию no.
-                                     В server.conf IPv6 /128 добавляется всегда для учёта адреса клиента.
+  CLIENT_MTU=1280                  - MTU в client.conf без вопроса
+  CLIENT_ENABLE_IPV6=yes|no        - добавить IPv6 Address и ::/0. По умолчанию no.
   ENDPOINT_HOST_OVERRIDE=example   - endpoint host для client.conf
   ENDPOINT_PORT_OVERRIDE=443       - endpoint port для client.conf
   DNS_SERVERS_OVERRIDE='1.1.1.1'   - DNS для client.conf
-  ROLLBACK_ON_RESTART_FAIL оставлена для совместимости; откат отключён, чтобы не перезаписывать server.conf
+  ROLLBACK_ON_RESTART_FAIL=yes|no  - откат server.conf и client.conf, если systemctl restart не удался. По умолчанию yes.
   QR_OUTPUT=no                     - не печатать QR-код
 EOF_USAGE
 }
@@ -87,6 +76,7 @@ generate_client_conf() {
     local endpoint="${10}"
     local allowed_ips="${11}"
     local enable_ipv6="${12}"
+    local server_ipv6_available="${13}"
 
     {
         cat <<EOF_CLIENT
@@ -96,8 +86,9 @@ Address = ${client_ipv4}/32
 EOF_CLIENT
         if [[ "$enable_ipv6" == "yes" ]]; then
             printf 'Address = %s/128\n' "$client_ipv6"
-        else
+        elif [[ "$server_ipv6_available" == "yes" ]]; then
             printf '# Address = %s/128\n' "$client_ipv6"
+            printf '# IPv6 is reserved for preview only. It is NOT added to server AllowedIPs unless CLIENT_ENABLE_IPV6=yes.\n'
         fi
         cat <<EOF_CLIENT
 DNS = ${dns_servers}
@@ -111,17 +102,14 @@ AllowedIPs = ${allowed_ips}
 Endpoint = ${endpoint}
 PersistentKeepalive = ${PERSISTENT_KEEPALIVE}
 EOF_CLIENT
-        if [[ "$enable_ipv6" != "yes" ]]; then
-            printf '# IPv6 address is reserved on the server side; enable CLIENT_ENABLE_IPV6=yes to route ::/0 through this client.\n'
-        fi
     } | write_new_file_from_stdin "$file" 600
 }
 
 main() {
     local client_name requested_if selected_if awg_bin server_conf clients_dir keys_dir vpn_if service_name endpoint_host endpoint_port endpoint
-    local dns_servers server_ipv4_cidr server_ipv6_cidr client_ipv4 client_ipv6 obfs_block
-    local client_privkey client_pubkey client_psk server_pubkey_file server_public_key server_private_key_file backup
-    local client_conf_file host_id client_mtu enable_ipv6 server_allowed_ips client_allowed_ips restart_ok
+    local dns_servers server_ipv4_cidr server_ipv6_cidr server_ipv6_available client_ipv4 client_ipv6 obfs_block
+    local client_privkey client_pubkey client_psk server_pubkey_file server_public_key server_private_key_file backup_dir
+    local client_conf_file host_id client_mtu enable_ipv6_raw enable_ipv6 server_allowed_ips client_allowed_ips restart_ok server_mtu
 
     require_root
     source_env_if_exists "$INSTALL_STATE_FILE"
@@ -161,34 +149,54 @@ main() {
     server_ipv4_cidr="$(get_server_ipv4_cidr "$server_conf" || true)"
     server_ipv6_cidr="$(get_server_ipv6_cidr "$server_conf" || true)"
     [[ -n "$server_ipv4_cidr" ]] || die "Не удалось определить IPv4 адрес сервера в ${server_conf}"
-    [[ -n "$server_ipv6_cidr" ]] || die "Не удалось определить IPv6 адрес сервера в ${server_conf}"
+
+    server_mtu="$(get_server_mtu "$server_conf" || true)"
+    server_ipv6_available="no"
+    if [[ -n "$server_ipv6_cidr" && "${SERVER_ENABLE_IPV6:-yes}" == "yes" ]]; then
+        if [[ -z "$server_mtu" || ! "$server_mtu" =~ ^[0-9]+$ || "$server_mtu" -ge 1280 ]]; then
+            server_ipv6_available="yes"
+        else
+            warn "В ${server_conf} есть IPv6, но MTU=${server_mtu} ниже 1280. IPv6 для новых клиентов отключён, чтобы не ловить сбой awg-quick на ip -6 route add."
+        fi
+    fi
 
     client_ipv4="$(next_free_ipv4 "$server_conf" "$server_ipv4_cidr")" || die "Не удалось найти свободный IPv4 адрес"
     host_id="${client_ipv4##*.}"
-    client_ipv6="$(client_ipv6_from_server_cidr "$server_ipv6_cidr" "$host_id")"
+    if [[ "$server_ipv6_available" == "yes" ]]; then
+        client_ipv6="$(client_ipv6_from_server_cidr "$server_ipv6_cidr" "$host_id")"
+    else
+        client_ipv6=""
+    fi
 
-    client_mtu="${CLIENT_MTU:-${DEFAULT_CLIENT_MTU:-1280}}"
-    client_mtu="$(prompt_until_valid "MTU клиента для ${client_name}" "$client_mtu" validate_mtu)"
+    while true; do
+        client_mtu="${CLIENT_MTU:-${DEFAULT_CLIENT_MTU:-1280}}"
+        client_mtu="$(prompt_until_valid "MTU клиента для ${client_name}" "$client_mtu" validate_mtu)"
+        break
+    done
 
-    enable_ipv6="$CLIENT_ENABLE_IPV6"
-    if [[ "$enable_ipv6" != "yes" && "$enable_ipv6" != "no" ]]; then
+    enable_ipv6_raw="$CLIENT_ENABLE_IPV6"
+    if ! enable_ipv6="$(normalise_yes_no "$enable_ipv6_raw" 2>/dev/null)"; then
         enable_ipv6="no"
     fi
-    if [[ -z "$CLIENT_ENABLE_IPV6_WAS_SET" && is_interactive ]]; then
-        if confirm "Маршрутизировать IPv6 через VPN для этого клиента? IPv6 Address в client.conf по умолчанию остаётся закомментированным" N; then
+    if [[ -z "$CLIENT_ENABLE_IPV6_WAS_SET" && is_interactive && "$server_ipv6_available" == "yes" ]]; then
+        if confirm "Маршрутизировать IPv6 через VPN для этого клиента? Это добавит IPv6 /128 в server.conf и ::/0 в client.conf" N; then
             enable_ipv6="yes"
         else
             enable_ipv6="no"
         fi
     fi
-
-    # The server peer always reserves both IPv4 and IPv6 addresses for the client.
-    # The client config keeps IPv6 commented by default unless routing was explicitly enabled.
-    server_allowed_ips="${client_ipv4}/32, ${client_ipv6}/128"
     if [[ "$enable_ipv6" == "yes" ]]; then
-        client_allowed_ips="0.0.0.0/0, ::/0"
-    else
-        client_allowed_ips="0.0.0.0/0"
+        [[ "$server_ipv6_available" == "yes" ]] || die "CLIENT_ENABLE_IPV6=yes запрошен, но серверный IPv6 недоступен/небезопасен для текущего MTU"
+        if (( client_mtu < 1280 )); then
+            die "CLIENT_ENABLE_IPV6=yes требует MTU клиента не ниже 1280"
+        fi
+    fi
+
+    server_allowed_ips="${client_ipv4}/32"
+    client_allowed_ips="0.0.0.0/0"
+    if [[ "$enable_ipv6" == "yes" ]]; then
+        server_allowed_ips="${server_allowed_ips}, ${client_ipv6}/128"
+        client_allowed_ips="${client_allowed_ips}, ::/0"
     fi
 
     ensure_dir "$clients_dir"
@@ -217,27 +225,37 @@ main() {
         endpoint="[${endpoint_host}]:${endpoint_port}"
     fi
 
-    generate_client_conf "$client_conf_file" "$client_privkey" "$client_ipv4" "$client_ipv6" "$dns_servers" "$client_mtu" "$obfs_block" "$server_public_key" "$client_psk" "$endpoint" "$client_allowed_ips" "$enable_ipv6"
+    begin_safe_operation "add-client-${vpn_if}-${client_name}" >/dev/null
+    backup_dir="$AWG_ACTIVE_BACKUP_DIR"
+    warn "Backup/rollback папка операции: $backup_dir"
+    operation_backup_path "$server_conf" >/dev/null
+    track_created_path "$client_conf_file"
 
-    backup="$(backup_file "$server_conf" "server-conf-${vpn_if}" || true)"
-    [[ -n "$backup" ]] && warn "Резервная копия server.conf: $backup"
+    generate_client_conf "$client_conf_file" "$client_privkey" "$client_ipv4" "$client_ipv6" "$dns_servers" "$client_mtu" "$obfs_block" "$server_public_key" "$client_psk" "$endpoint" "$client_allowed_ips" "$enable_ipv6" "$server_ipv6_available"
     append_peer_to_server_conf "$server_conf" "$client_name" "$client_pubkey" "$client_psk" "$server_allowed_ips"
 
     restart_ok="yes"
     if ! systemctl restart "$service_name"; then
         restart_ok="no"
         warn "Не удалось перезапустить ${service_name}. Проверьте: journalctl -u ${service_name} -n 100 --no-pager"
-        if [[ "$ROLLBACK_ON_RESTART_FAIL" == "yes" ]]; then
-            warn "ROLLBACK_ON_RESTART_FAIL=yes проигнорирован: откат потребовал бы перезаписать ${server_conf}. Старое содержимое сохранено в backup, новый peer был только дописан."
+        if [[ "$(normalise_yes_no "$ROLLBACK_ON_RESTART_FAIL" 2>/dev/null || printf yes)" == "yes" ]]; then
+            rollback_safe_operation 1
+            AWG_OPERATION_COMMITTED="yes"
+            trap - EXIT INT TERM
+            systemctl restart "$service_name" >/dev/null 2>&1 || true
+            die "Изменения клиента ${client_name} откачены из backup: $backup_dir"
         fi
     fi
 
+    commit_safe_operation
     ok "Клиент добавлен: ${client_name}"
     ok "Интерфейс: ${vpn_if}"
     ok "Серверный конфиг дополнен: ${server_conf}"
     ok "Клиентский конфиг создан: ${client_conf_file}"
     ok "MTU клиента: ${client_mtu}"
+    ok "AllowedIPs на сервере: ${server_allowed_ips}"
     [[ "$restart_ok" == "yes" ]] && ok "Сервис перезапущен: ${service_name}"
+    ok "Backup папка операции: $backup_dir"
 
     if [[ "$QR_OUTPUT" == "yes" ]] && command -v qrencode >/dev/null 2>&1; then
         printf '\nQR-код для быстрого импорта:\n'

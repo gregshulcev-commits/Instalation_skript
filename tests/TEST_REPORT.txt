@@ -1,5 +1,5 @@
 AmneziaWG bundle test report
-Generated: 2026-04-24 20:34:35 UTC
+Generated: 2026-04-25 08:56:49 UTC
 
 == Подготовка окружения ==
 [PASS] Подготовлены fake sources и заглушки
@@ -20,7 +20,7 @@ Generated: 2026-04-24 20:34:35 UTC
 [PASS] 03_setup_nftables.sh создаёт template с policy drop, SSH allow и NAT
 
 == Тест 04_add_client.sh IPv4-only по умолчанию ==
-[PASS] 04_add_client.sh дописывает Grafana-friendly peer, резервирует IPv6 и создаёт client.conf
+[PASS] 04_add_client.sh дописывает Grafana-friendly peer, резервирует IPv6 комментарием и создаёт IPv4-only client.conf
 
 == Тест запрета перезаписи существующего интерфейса ==
 [PASS] 02_create_server_config.sh не перезаписывает существующий интерфейс даже при OVERWRITE_EXISTING_IFACE=yes
@@ -34,10 +34,19 @@ Generated: 2026-04-24 20:34:35 UTC
 == Тест добавления клиента на awg1 ==
 [PASS] 04_add_client.sh добавляет клиента в выбранный интерфейс
 
-== Тест 05_update_amneziawg.sh append-only install.env ==
-[PASS] 05_update_amneziawg.sh выполняется на заглушках и не перезаписывает install.env
+== Тест 05_update_amneziawg.sh атомарно перезаписывает install.env с backup ==
+[PASS] 05_update_amneziawg.sh выполняется на заглушках, перезаписывает install.env и сохраняет backup
 
 == Тест единого мастера --status ==
 [PASS] 00_manage.sh сканирует существующую установку
+
+== Тест явного IPv6 клиента на awg0 ==
+[PASS] 04_add_client.sh добавляет IPv6 /128 только при явном CLIENT_ENABLE_IPV6=yes
+
+== Тест удаления клиента и restore remove-client backup ==
+[PASS] 08_remove_client.sh удаляет клиента, а 10_restore_backup.sh возвращает его из backup
+
+== Тест удаления интерфейса awg1 с очисткой nftables и restore backup ==
+[PASS] 09_remove_interface.sh удаляет интерфейс и чистит firewall, а restore возвращает состояние
 
 ИТОГ: все автоматические тесты завершились успешно.

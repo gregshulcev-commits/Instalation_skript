@@ -1,141 +1,134 @@
 TROUBLESHOOTING
 ===============
 
-AWG не подключается у некоторых мобильных операторов, а WG работает
--------------------------------------------------------------------
-Основные отличия AWG от обычного WG:
-- AWG добавляет obfuscation параметры;
-- handshake и первые UDP-пакеты могут иметь другой размер и профиль;
-- агрессивные Jc/Jmin/Jmax могут хуже проходить через некоторые мобильные сети;
-- MTU нужно проверять и на сервере, и на клиенте.
+Ошибка awg-quick: ip -6 route add ... RTNETLINK answers: No such device
+-----------------------------------------------------------------------
+Типичный лог:
 
-Первый безопасный профиль для проверки
---------------------------------------
-Создайте отдельный тестовый интерфейс, например awg1:
+  awg-quick up awg800
+  ip link add awg800 type amneziawg
+  awg setconf awg800 /dev/fd/63
+  ip -4 address add 10.8.3.1/24 dev awg800
+  ip -6 address add fd42:42:44::1/64 dev awg800
+  ip link set mtu 800 up dev awg800
+  ip -6 route add fd42:42:44::2/128 dev awg800
+  RTNETLINK answers: No such device
+  ip link delete dev awg800
 
-  server MTU = 1280
-  client MTU = 1280
-  ListenPort = 443 или другой реально открытый UDP-порт
-  Jc = 4..7
-  Jmin = 10..50
-  Jmax = 200..1000
+Что происходит:
+- awg-quick видит IPv6 /128 у peer в server.conf AllowedIPs;
+- поэтому пытается добавить IPv6 route к peer;
+- при некорректной/небезопасной IPv6+MTU конфигурации интерфейс падает.
 
-Если хотите проверить меньший client MTU:
+Что изменено:
+- новые клиенты по умолчанию получают в server.conf только IPv4 /32;
+- IPv6 /128 добавляется только при CLIENT_ENABLE_IPV6=yes;
+- IPv6 + MTU ниже 1280 блокируется.
 
-  server MTU = 1280
-  client MTU = 1200
+Что сделать с уже созданным старым конфигом:
+1. Откройте server.conf:
 
-Для IPv6 не опускайте MTU ниже 1280 без отдельного понимания последствий.
+     sudo nano /etc/amnezia/amneziawg/awg800.conf
 
-Как проверить, виноват ли порт/оператор
----------------------------------------
-На сервере во время попытки подключения:
+2. Найдите peer, где есть строка вида:
 
-  sudo tcpdump -ni any udp port 56789
+     AllowedIPs = 10.8.3.2/32, fd42:42:44::2/128
 
-или если интерфейс слушает 443:
+3. Если IPv6 не нужен, временно оставьте только IPv4:
 
-  sudo tcpdump -ni any udp port 443
+     AllowedIPs = 10.8.3.2/32
 
-Интерпретация:
+4. Если IPv6 нужен, поднимите MTU до 1280+ и проверьте внешнюю IPv6-маршрутизацию/firewall.
 
-1. Пакетов нет вообще
-   Скорее всего, оператор/маршрут/провайдерский firewall/порт не пропускает UDP до сервера.
+5. Проверьте:
 
-2. Пакеты есть, но handshake не появляется
-   Проверяйте совпадение AWG параметров, ключи, endpoint, MTU, AllowedIPs, серверный firewall.
+     sudo awg-quick up /etc/amnezia/amneziawg/awg800.conf
 
-3. Handshake есть, но интернет не работает
-   Проверяйте nftables masquerade, ip_forward, AllowedIPs клиента и DNS.
+nftables снова показывает дубли
+-------------------------------
+Запустите пересборку:
 
-Проверка состояния интерфейсов
-------------------------------
+  sudo ./scripts/03_setup_nftables.sh
 
-  sudo ./install.sh --status
+Проверьте, что итоговый файл начинается с:
 
-или:
+  flush ruleset
 
-  sudo ./scripts/00_manage.sh --status
-
-Проверка сервиса:
-
-  sudo systemctl status awg-quick@awg0.service
-  sudo journalctl -u awg-quick@awg0.service -n 100 --no-pager
-
-Проверка AWG peers:
-
-  sudo awg show
-
-Проверка маршрутизации и firewall:
-
-  sudo nft list ruleset
-  cat /etc/sysctl.d/00-amnezia.conf
-  sysctl net.ipv4.ip_forward
-
-Почему лучше добавлять второй интерфейс для теста
-------------------------------------------------
-Если текущий awg0 работает у части клиентов, не меняйте его резко. Создайте awg1 с другим портом, другой подсетью, другим MTU и более мягкими AWG параметрами. Так вы сможете тестировать проблемного оператора без риска сломать рабочий awg0.
-
-Пример:
-
-  sudo ./install.sh
-  -> 3) Создать новый интерфейс AWG
-
-Параметры:
-
-  iface: awg1
-  port: 443
-  IPv4: 10.8.2.1/24
-  IPv6: fd42:42:43::1/64
-  server MTU: 1280
-  client MTU: 1280
-  Jc: 4
-  Jmin: 10
-  Jmax: 200
-
-После этого добавьте клиента именно на awg1 и проверьте его у проблемного оператора.
-
-Если порт 443 пробрасывается на 56789
--------------------------------------
-Лучше проверить отдельный вариант без DNAT/REDIRECT:
-
-  ListenPort = 443
-
-на самом AWG-интерфейсе. Так исключается дополнительный слой NAT и проще понять, что реально видит серверный tcpdump.
-
-IPv6 и AllowedIPs
------------------
-По умолчанию bundle резервирует IPv6-адрес на сервере, но клиент остаётся IPv4-only:
-
-  server.conf:
-    AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
-
-  client.conf:
-    Address = 10.8.1.2/32
-    # Address = fd42:42:42::2/128
-    AllowedIPs = 0.0.0.0/0
-
-Это безопаснее, если серверный IPv6 не настроен полностью. Если включить ::/0 без рабочего IPv6 firewall/route/NAT, часть клиентов может вести себя нестабильно.
-
-Для включения IPv6-маршрутизации в client.conf:
-
-  sudo CLIENT_ENABLE_IPV6=yes ./scripts/04_add_client.sh phone awg0
-
-Но сначала убедитесь, что IPv6 на сервере действительно настроен.
-
-
-nftables: появились дубли или старая table ip amneziawg_bundle
---------------------------------------------------------------
-Старые версии bundle могли добавить отдельную table ip amneziawg_bundle рядом с вашим table inet filter/table inet nat. Новая версия при понятном native firewall делает candidate без этой старой bundle-table и обновляет существующие строки.
-
-Для вашего сценария с awg0:56789, awg1:520 и redirect 53/443 -> 56789 итоговые важные строки должны быть примерно такими:
+и что AWG-правила представлены одной строкой на группу:
 
   iifname "ens3" udp dport { 56789, 520 } accept
-  iifname "ens3" udp dport { 53, 443 } accept
   iifname { "awg0", "awg1" } oifname "ens3" masquerade
-  udp dport { 53, 443 } redirect to :56789
 
-Если скрипт пишет, что формат непонятен, он не меняет файл. Тогда сделайте backup вручную, добавьте строки выше в существующие chain input/postrouting и проверьте:
+Если после ручных правок runtime ruleset всё равно содержит старые правила, примените полный reload:
 
   sudo nft -c -f /etc/nftables.conf
   sudo nft -f /etc/nftables.conf
+
+Скрипт отказался менять nftables
+--------------------------------
+Это ожидаемо, если структура firewall нестандартная или нет понятной пары:
+
+  table inet filter / chain input
+  table inet nat / chain postrouting
+
+В этом случае скрипт печатает ручные инструкции и не трогает файл. Сделайте backup вручную, перенесите показанные строки и проверьте `nft -c -f`.
+
+Клиент не подключается извне
+----------------------------
+Проверьте:
+
+1. Порт слушается в server.conf:
+
+     grep -E 'ListenPort|Address|MTU' /etc/amnezia/amneziawg/awg0.conf
+
+2. nftables разрешает UDP порт на внешнем интерфейсе:
+
+     sudo nft list ruleset | grep -E 'udp dport|masquerade'
+
+3. Endpoint в client.conf указывает на публичный IP/домен и правильный порт.
+
+4. Сервис поднят:
+
+     sudo systemctl status awg-quick@awg0.service --no-pager
+
+5. Логи:
+
+     sudo journalctl -u awg-quick@awg0.service -n 100 --no-pager
+
+Удаление клиента пошло не так
+-----------------------------
+Каждое удаление создаёт backup:
+
+  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-remove-client-IFACE-CLIENT
+
+Откат:
+
+  sudo ./scripts/10_restore_backup.sh /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-remove-client-IFACE-CLIENT
+
+Удаление интерфейса пошло не так
+--------------------------------
+Каждое удаление интерфейса создаёт backup:
+
+  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-remove-interface-IFACE
+
+Откат:
+
+  sudo RESTORE_CONFIRM=yes RESTORE_APPLY_NFT=yes RESTORE_RESTART_SERVICES=yes \
+       ./scripts/10_restore_backup.sh /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-remove-interface-IFACE
+
+После restore проверьте:
+
+  sudo ./scripts/00_manage.sh --status
+  sudo nft -c -f /etc/nftables.conf
+
+Хочу полностью откатить последнюю операцию
+-----------------------------------------
+Посмотрите последние backup-папки:
+
+  sudo ls -lt /etc/amnezia/amneziawg/backups
+
+Выберите нужную и выполните restore:
+
+  sudo ./scripts/10_restore_backup.sh /etc/amnezia/amneziawg/backups/<папка>
+
+Перед restore скрипт создаст pre-restore backup, так что сам restore тоже можно отменить.

@@ -26,7 +26,7 @@ usage() {
   2. Показывает, что уже сделано.
   3. Если установка не найдена, предлагает установить из исходников.
   4. Если интерфейсов нет, предлагает создать первый интерфейс.
-  5. Если интерфейсы есть, предлагает добавить клиента, добавить новый интерфейс, пересобрать firewall или обновить AWG.
+  5. Если интерфейсы есть, предлагает добавить/удалить клиента, добавить/удалить интерфейс, пересобрать firewall, восстановить backup или обновить AWG.
 EOF_USAGE
 }
 
@@ -60,7 +60,7 @@ service_state() {
 }
 
 status_report() {
-    local awg_bin awg_quick_bin iface conf port mtu ipv4 ipv6 env_file client_mtu clients service ext_if ssh_port n
+    local awg_bin awg_quick_bin iface conf port mtu ipv4 ipv6 env_file client_mtu server_enable_ipv6 clients service ext_if ssh_port n ipv6_peer_routes
     awg_bin="$(detect_awg_bin)"
     awg_quick_bin="$(detect_awg_quick_bin)"
 
@@ -96,12 +96,17 @@ status_report() {
             ipv6="$(get_server_ipv6_cidr "$conf" || true)"
             env_file="$(manager_env_for_iface "$iface")"
             client_mtu=""
+            server_enable_ipv6=""
             if [[ -f "$env_file" ]]; then
+                DEFAULT_CLIENT_MTU=""
+                SERVER_ENABLE_IPV6=""
                 # shellcheck disable=SC1090
                 source "$env_file"
                 client_mtu="${DEFAULT_CLIENT_MTU:-}"
+                server_enable_ipv6="${SERVER_ENABLE_IPV6:-}"
             fi
             clients="$(count_clients_for_iface "$iface")"
+            ipv6_peer_routes="$(grep -Ec '^[[:space:]]*AllowedIPs[[:space:]]*=.*:' "$conf" 2>/dev/null || true)"
             service="awg-quick@${iface}.service"
             printf '  - %s\n' "$iface"
             printf '      conf:        %s\n' "$conf"
@@ -109,7 +114,14 @@ status_report() {
             printf '      listen_port: %s\n' "${port:-?}"
             printf '      server_mtu:  %s\n' "${mtu:-?}"
             printf '      client_mtu:  %s\n' "${client_mtu:-?}"
+            printf '      ipv6_mode:   %s\n' "${server_enable_ipv6:-auto}"
             printf '      clients:     %s (peers/files)\n' "$clients"
+            if [[ "${mtu:-0}" =~ ^[0-9]+$ && "${mtu:-0}" -lt 1280 && -n "${ipv6:-}" ]]; then
+                printf '      warning:     IPv6 address + MTU %s < 1280. Лучше отключить IPv6 или поднять MTU.\n' "$mtu"
+            fi
+            if [[ "$ipv6_peer_routes" != "0" ]]; then
+                printf '      ipv6_peers:  %s peer route(s) in AllowedIPs\n' "$ipv6_peer_routes"
+            fi
             printf '      service:     %s\n' "$(service_state "$service")"
         done < <(list_awg_interfaces_from_confs)
     fi
@@ -157,6 +169,23 @@ add_client_flow() {
     "${SCRIPT_DIR}/04_add_client.sh" "$client_name" "$iface"
 }
 
+remove_client_flow() {
+    local iface client_name
+    iface="$(select_iface_interactive "")"
+    client_name="$(prompt_default "Имя клиента для удаления" "client1")"
+    "${SCRIPT_DIR}/08_remove_client.sh" "$client_name" "$iface"
+}
+
+remove_interface_flow() {
+    local iface
+    iface="$(select_iface_interactive "")"
+    "${SCRIPT_DIR}/09_remove_interface.sh" "$iface"
+}
+
+restore_backup_flow() {
+    "${SCRIPT_DIR}/10_restore_backup.sh"
+}
+
 rebuild_firewall_flow() {
     "${SCRIPT_DIR}/03_setup_nftables.sh"
 }
@@ -194,8 +223,11 @@ menu_loop() {
         printf '  4) Добавить клиента в существующий интерфейс\n'
         printf '  5) Пересобрать nftables/NAT для всех интерфейсов\n'
         printf '  6) Обновить/восстановить AWG и перезапустить интерфейсы\n'
+        printf '  7) Удалить клиента из интерфейса\n'
+        printf '  8) Удалить интерфейс AWG\n'
+        printf '  9) Восстановить состояние из backup\n'
         printf '  0) Выход\n'
-        choice="$(prompt_choice "Выбор" "4" "0 1 2 3 4 5 6")"
+        choice="$(prompt_choice "Выбор" "4" "0 1 2 3 4 5 6 7 8 9")"
         case "$choice" in
             1) status_report ;;
             2) "${SCRIPT_DIR}/01_install_from_source.sh" ;;
@@ -203,6 +235,9 @@ menu_loop() {
             4) add_client_flow ;;
             5) rebuild_firewall_flow ;;
             6) update_flow ;;
+            7) remove_client_flow ;;
+            8) remove_interface_flow ;;
+            9) restore_backup_flow ;;
             0) return 0 ;;
         esac
     done

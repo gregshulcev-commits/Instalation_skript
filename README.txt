@@ -3,278 +3,226 @@ AmneziaWG bash bundle
 
 Назначение
 ----------
-Этот bundle устанавливает и обслуживает сервер AmneziaWG из исходников. Он рассчитан на два сценария:
+Этот набор bash-скриптов устанавливает и обслуживает сервер AmneziaWG из исходников, создаёт несколько AWG-интерфейсов на одном сервере, добавляет/удаляет клиентов, пересобирает nftables/NAT и умеет откатывать изменения из timestamp-backup.
 
-1. Первый запуск на чистом сервере.
-2. Добавление второго и последующих AWG-интерфейсов на тот же сервер без поломки уже работающих интерфейсов.
-
-Главный входной скрипт
-----------------------
-Запускайте один скрипт из корня распакованного архива:
+Главный входной скрипт:
 
   sudo ./install.sh
 
-Или напрямую:
+или напрямую:
 
   sudo ./scripts/00_manage.sh
 
-00_manage.sh сам сканирует состояние сервера и показывает:
-- найден ли awg;
-- найден ли awg-quick;
-- есть ли install.env;
-- есть ли sysctl-файл с ip_forward;
-- есть ли nftables.conf;
-- какие /etc/amnezia/amneziawg/*.conf уже существуют;
-- какие ListenPort, Address, server MTU и client MTU у каждого интерфейса;
-- сколько клиентов найдено в server.conf и в папке клиентских конфигов;
-- состояние systemd service awg-quick@<iface>.service.
+Что исправлено в этой сборке
+----------------------------
+1. Исправлена практическая причина сбоя вида:
 
-После сканирования скрипт предлагает логичное действие:
-- если awg/awg-quick не найдены — установить AmneziaWG из исходников;
-- если установка есть, но интерфейсов нет — создать первый интерфейс;
-- если интерфейсы уже есть — добавить клиента, добавить новый интерфейс, пересобрать firewall/NAT или обновить AWG.
+     awg-quick up awg800
+     ...
+     ip -6 route add fd42:42:44::2/128 dev awg800
+     RTNETLINK answers: No such device
 
-Защита от перезаписи старых данных
-----------------------------------
-Исправленная версия придерживается append/create-only политики для bundle-данных:
-- существующие interface/server/client .conf не перезаписываются;
-- install.env, manager.env, firewall.env и sysctl дополняются, старые строки остаются как были;
-- /etc/nftables.conf получает timestamp-backup перед изменением;
-- если firewall пустой, создаётся безопасный template с input policy drop и явным SSH allow;
-- если firewall уже есть в понятном формате table inet filter/nat, обновляются существующие правила без второй input-chain;
-- если firewall непонятен, автоматическое изменение останавливается и печатаются ручные инструкции;
-- глобальный flush ruleset не используется;
-- source/cache/DKMS пути создаются заново, старые каталоги не удаляются;
-- awg-tools при реальной сборке ставятся в новый отдельный каталог TOOLS_INSTALL_ROOT, а не поверх старых awg/awg-quick бинарников.
+   В старой логике клиентский IPv6 /128 попадал в server.conf автоматически. Из-за этого awg-quick пытался добавить IPv6-маршрут к peer. Теперь новый клиент по умолчанию IPv4-only:
 
-Быстрый старт с нуля
---------------------
+     server.conf: AllowedIPs = 10.8.X.Y/32
+     client.conf: AllowedIPs = 0.0.0.0/0
 
-  tar -xzf amneziawg_bash_bundle_fixed.tar.gz
-  cd amneziawg_bundle
+   IPv6 /128 добавляется в server.conf только при явном CLIENT_ENABLE_IPV6=yes. Если IPv6 включён, MTU ниже 1280 запрещён/блокируется как небезопасный вариант.
+
+2. nftables больше не дописывается бесконечными дублями. Скрипт строит итоговый candidate, сохраняет backup и перезаписывает /etc/nftables.conf. Итоговый файл начинается с `flush ruleset`, чтобы `nft -f /etc/nftables.conf` заменял runtime ruleset, а не наслаивал старые правила.
+
+3. install.env, manager.env и firewall.env теперь перезаписываются атомарно с backup, а не дописываются блоками. sysctl остаётся append-safe: старые строки не редактируются, новое значение добавляется в конец.
+
+4. Добавлены timestamp-backup и restore:
+
+     /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-label/
+       INFO
+       MANIFEST.tsv
+       CREATED_PATHS        # если операция создавала новые файлы
+       files/...
+
+   Откат:
+
+     sudo ./scripts/10_restore_backup.sh /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-label
+
+5. Добавлены новые операции:
+
+     sudo ./scripts/08_remove_client.sh <client_name> [iface]
+     sudo ./scripts/09_remove_interface.sh [iface]
+     sudo ./scripts/10_restore_backup.sh [backup_dir]
+
+6. Улучшены подсказки интерфейса:
+   - подсказки по Jc/Jmin/Jmax/S1/S2/H1-H4;
+   - следующий свободный IPv4 default: 10.8.1.1/24, затем 10.8.2.1/24, ...;
+   - следующий IPv6 ULA default: fd42:42:42::1/64, затем fd42:42:43::1/64, ...;
+   - endpoint host по умолчанию берётся из системного IPv4 source address.
+
+Быстрый старт
+-------------
+
+  unzip amneziawg_bash_bundle_FIXED_20260425.zip
+  cd amneziawg_bash_bundle_GIT
   sudo ./install.sh
 
-Во время создания интерфейса можно задать:
-- имя интерфейса, например awg0;
-- UDP ListenPort, например 56789 или 443;
-- внутренний IPv4 адрес сервера, например 10.8.1.1/24;
-- внутренний IPv6 ULA адрес, например fd42:42:42::1/64;
+Дальше используйте меню:
+
+  1) Показать состояние
+  2) Установить/переустановить AmneziaWG из исходников
+  3) Создать новый интерфейс AWG
+  4) Добавить клиента в существующий интерфейс
+  5) Пересобрать nftables/NAT для всех интерфейсов
+  6) Обновить/восстановить AWG и перезапустить интерфейсы
+  7) Удалить клиента из интерфейса
+  8) Удалить интерфейс AWG
+  9) Восстановить состояние из backup
+  0) Выход
+
+Создание интерфейса
+-------------------
+Через меню выберите пункт 3 или запустите напрямую:
+
+  sudo ./scripts/02_create_server_config.sh
+
+Скрипт спросит:
+- имя интерфейса, например awg0/awg1;
+- UDP ListenPort;
+- IPv4 адрес сервера в туннеле, строго /24;
+- включать ли IPv6 на серверном интерфейсе;
+- IPv6 ULA /64, если IPv6 включён;
 - публичный endpoint host для клиентов;
 - DNS для клиентов;
-- MTU сервера;
-- MTU клиента по умолчанию;
-- AWG obfuscation параметры: Jc, Jmin, Jmax, S1, S2, H1, H2, H3, H4.
+- MTU сервера и MTU клиента по умолчанию;
+- obfuscation параметры Jc/Jmin/Jmax/S1/S2/H1-H4.
 
-Рекомендуемый безопасный старт для проблемных мобильных сетей:
-
-  server MTU: 1280
-  client MTU: 1280
-
-Если требуется проверить гипотезу с меньшим MTU, можно задать, например, client MTU 1200. Но помните: MTU ниже 1280 может конфликтовать с IPv6, поэтому для IPv4-only теста это допустимо, а для IPv6 лучше начинать с 1280.
-
-Добавление второго интерфейса
------------------------------
-Запустите тот же самый главный скрипт:
-
-  sudo ./install.sh
-
-Дальше выберите:
-
-  3) Создать новый интерфейс AWG
-
-Скрипт сам предложит следующее свободное имя awgN. Например, если awg0 уже есть, будет предложено awg1.
-
-Для второго интерфейса обязательно задайте отдельные подсети, например:
-
-  awg0: 10.8.1.1/24 и fd42:42:42::1/64
-  awg1: 10.8.2.1/24 и fd42:42:43::1/64
-
-После создания нового интерфейса скрипт предложит обновить nftables/NAT для всех интерфейсов. Это важно: firewall-файл должен учитывать все ListenPort и все AWG interface names одновременно.
-
-Новая логика nftables не создаёт вторую input-chain рядом с уже существующей. Если у вас уже есть table inet filter и table inet nat, скрипт пытается аккуратно обновить существующие строки: объединить AWG UDP-порты и masquerade для awg0/awg1, сохранить ваши redirect/DNAT правила и сделать timestamp-backup. Если структура firewall непонятна, скрипт не меняет файл автоматически и показывает, что добавить вручную.
+Если IPv6 включён, server MTU ниже 1280 не принимается. Это сделано специально, потому что IPv6 требует минимальный MTU 1280.
 
 Добавление клиента
 ------------------
-Через главный скрипт:
-
-  sudo ./install.sh
-
-Выберите:
-
-  4) Добавить клиента в существующий интерфейс
-
-Если интерфейсов несколько, скрипт покажет список и спросит, куда добавить клиента.
-
-Ручной запуск тоже поддерживается:
 
   sudo ./scripts/04_add_client.sh phone awg0
-  sudo ./scripts/04_add_client.sh phone2 awg1
 
-При добавлении клиента скрипт:
-- берёт параметры из manager-<iface>.env;
-- выбирает следующий свободный IPv4 в /24 подсети интерфейса;
-- резервирует соответствующий IPv6 /128 на сервере;
-- спрашивает MTU клиента или использует DEFAULT_CLIENT_MTU;
-- генерирует ключи клиента и PresharedKey;
-- создаёт client.conf;
-- добавляет peer в правильный server.conf в формате с # friendly_name=... для Grafana;
-- перед append создаёт timestamp-backup server.conf;
-- перезапускает только нужный awg-quick@<iface>.service.
+По умолчанию клиент IPv4-only:
 
-Формат server.conf для клиента:
+  [Interface]
+  Address = 10.8.1.2/32
+  # Address = fd42:42:42::2/128
+  AllowedIPs = 0.0.0.0/0
 
-  [Peer]
-  # friendly_name=phone
-  PublicKey = ...
-  PresharedKey = ...
-  AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128
+  server.conf peer:
+  AllowedIPs = 10.8.1.2/32
 
-IPv6 для клиентов
------------------
-По умолчанию клиент создаётся в IPv4-only режиме, но IPv6-адрес клиента резервируется на сервере:
+Это безопасный режим, который не заставляет awg-quick добавлять IPv6 /128 route.
 
-  server.conf:
-    AllowedIPs = 10.8.X.Y/32, fd42:...::Y/128
+Явное включение IPv6 для клиента:
+
+  sudo CLIENT_ENABLE_IPV6=yes CLIENT_MTU=1280 ./scripts/04_add_client.sh phone6 awg0
+
+Тогда будет:
 
   client.conf:
-    Address = 10.8.X.Y/32
-    # Address = fd42:...::Y/128
-    AllowedIPs = 0.0.0.0/0
-
-Это сделано безопаснее, потому что nftables в bundle настраивает только IPv4 NAT, а у многих серверов нет рабочего внешнего IPv6. При этом адрес IPv6 уже закреплён за peer и его легко раскомментировать позже.
-
-Если вы сознательно хотите включить IPv6 в клиентском конфиге:
-
-  sudo CLIENT_ENABLE_IPV6=yes ./scripts/04_add_client.sh phone awg0
-
-Тогда будет создано:
-
-  Address = 10.8.X.Y/32
-  Address = fd42:...::Y/128
+  Address = 10.8.1.3/32
+  Address = fd42:42:42::3/128
   AllowedIPs = 0.0.0.0/0, ::/0
 
-Перед включением IPv6 убедитесь, что понимаете маршрутизацию и firewall для IPv6.
+  server.conf peer:
+  AllowedIPs = 10.8.1.3/32, fd42:42:42::3/128
 
-Файлы состояния
+Удаление клиента
+----------------
+
+  sudo ./scripts/08_remove_client.sh phone awg0
+
+Что делает:
+- создаёт backup server.conf и client.conf;
+- удаляет peer block с `# friendly_name=phone` или legacy `### Client phone`;
+- удаляет файл clients/phone.conf;
+- перезапускает только awg-quick@awg0.service;
+- при ошибке restart по умолчанию откатывает изменения.
+
+Удаление интерфейса
+-------------------
+
+  sudo CONFIRM_REMOVE=yes ./scripts/09_remove_interface.sh awg1
+
+Что делает:
+- останавливает/отключает awg-quick@awg1.service;
+- удаляет awg1.conf, manager-awg1.env, clients/keys папки интерфейса;
+- переключает manager.env на оставшийся интерфейс;
+- пересобирает nftables, удаляя UDP allow и masquerade удалённого интерфейса;
+- сохраняет всё в одну backup-папку.
+
+Откат из backup
 ---------------
-Основные файлы:
 
-  /etc/amnezia/amneziawg/install.env
-      Пути к awg, awg-quick, кешу исходников и sysctl-файлу. При повторной установке новые значения дописываются в конец, старые строки не меняются.
+Интерактивно:
 
-  /etc/amnezia/amneziawg/firewall.env
-      Внешний интерфейс и SSH-порт, использованные при последней генерации nftables. Новые значения дописываются append-only.
+  sudo ./scripts/10_restore_backup.sh
 
-  /etc/amnezia/amneziawg/manager.env
-      Указатель на последний созданный/настроенный интерфейс. Оставлен для совместимости. Обновляется append-only: shell source берёт последние значения.
+Или явно:
 
-  /etc/amnezia/amneziawg/manager-awg0.env
-  /etc/amnezia/amneziawg/manager-awg1.env
-      Индивидуальные настройки каждого интерфейса.
+  sudo RESTORE_CONFIRM=yes RESTORE_APPLY_NFT=yes RESTORE_RESTART_SERVICES=yes \
+    ./scripts/10_restore_backup.sh /etc/amnezia/amneziawg/backups/20260425-120000-remove-interface-awg1
 
-  /etc/amnezia/amneziawg/awg0.conf
-  /etc/amnezia/amneziawg/awg1.conf
-      Серверные конфиги интерфейсов.
-
-  /etc/amnezia/amneziawg/keys/
-  /etc/amnezia/amneziawg/clients/
-      Ключи и клиенты для awg0 в совместимом layout.
-
-  /etc/amnezia/amneziawg/awg1/keys/
-  /etc/amnezia/amneziawg/awg1/clients/
-      Ключи и клиенты для второго и последующих интерфейсов.
-
-Почему awg0 хранится иначе
---------------------------
-Для совместимости с предыдущими single-interface установками awg0 использует старые папки:
-
-  /etc/amnezia/amneziawg/keys
-  /etc/amnezia/amneziawg/clients
-
-Если у вас уже была более ранняя тестовая версия, где awg0 хранился в /etc/amnezia/amneziawg/awg0/clients, скрипт умеет использовать существующий layout и не ломает его.
+Перед restore текущие файлы ещё раз сохраняются в pre-restore backup, чтобы можно было откатить сам restore.
 
 nftables
 --------
-Скрипт scripts/03_setup_nftables.sh сканирует все найденные AWG конфиги:
+
+  sudo ./scripts/03_setup_nftables.sh
+
+Скрипт сканирует все:
 
   /etc/amnezia/amneziawg/*.conf
 
-Он настраивает:
-- разрешение UDP ListenPort каждого AWG интерфейса на внешнем интерфейсе;
-- input policy drop при создании нового template;
-- явное разрешение SSH-порта, по умолчанию 22/tcp;
-- IPv4 masquerade для выхода в интернет через внешний интерфейс;
-- сохранение redirect/DNAT правил, если они уже были в существующем firewall.
+и формирует единые правила:
 
-Поведение по режимам:
+  iifname "ens3" udp dport { 56789, 520 } accept
+  iifname { "awg0", "awg1" } oifname "ens3" masquerade
 
-1. Если /etc/nftables.conf отсутствует или пустой, создаётся новый template с table inet filter и table inet nat.
-2. Если уже есть понятный формат table inet filter + table inet nat, скрипт обновляет существующие chain input/postrouting: объединяет AWG порты, объединяет masquerade для awg0/awg1 и удаляет старый bundle-owned table ip amneziawg_bundle из candidate.
-3. Если формат непонятный, файл не меняется: скрипт печатает ручные строки для добавления.
+Если в существующем firewall есть пользовательские правила, например:
 
-Перед изменением существующего /etc/nftables.conf создаётся backup:
+  iifname "ens3" udp dport { 53, 443 } accept
+  udp dport { 53, 443 } redirect to :56789
+  iifname "awg0" tcp dport 3000 accept
 
-  /etc/amnezia/amneziawg/backups/YYYYMMDD-HHMMSS-nftables/nftables.conf
+они сохраняются при понятной структуре `table inet filter` + `table inet nat`. Старые AWG-дубли и старая `table ip amneziawg_bundle` удаляются из candidate.
 
-Глобальный flush ruleset не используется. AWG services из firewall-скрипта не перезапускаются, чтобы не трогать работающий awg0.
+Проверка состояния
+------------------
 
-Ручные скрипты
---------------
-Все низкоуровневые скрипты сохранены:
+  sudo ./scripts/00_manage.sh --status
 
-  scripts/01_install_from_source.sh     установка/переустановка AWG из исходников
-  scripts/02_create_server_config.sh    создание одного интерфейса
-  scripts/03_setup_nftables.sh          firewall/NAT для всех интерфейсов
-  scripts/04_add_client.sh              добавление клиента в выбранный интерфейс
-  scripts/05_update_amneziawg.sh        обновление/восстановление AWG
-  scripts/06_run_all.sh                 совместимый wrapper на 00_manage.sh
-  scripts/07_add_interface.sh           совместимый shortcut для добавления интерфейса
-
-Но обычный путь теперь один:
-
-  sudo ./install.sh
-
-Офлайн-режим
-------------
-Если на сервере нет доступа к GitHub:
-
-1. На машине с интернетом выполните:
-
-     ./sources/download_upstream_sources.sh
-
-2. Убедитесь, что в sources/ появились архивы:
-
-     amneziawg-linux-kernel-module-master.tar.gz
-     amneziawg-tools-master.tar.gz
-
-3. Перенесите весь bundle на сервер.
-4. Запустите:
-
-     sudo FORCE_OFFLINE=yes ./install.sh
+В статусе показываются:
+- пути к awg/awg-quick;
+- наличие install.env, firewall.env, nftables.conf;
+- список интерфейсов;
+- IPv4/IPv6 Address, ListenPort, server/client MTU;
+- SERVER_ENABLE_IPV6;
+- количество peer/routes и client.conf файлов;
+- предупреждение, если в server.conf есть IPv6 при MTU ниже 1280;
+- состояние awg-quick@<iface>.service.
 
 Тесты
 -----
-В архиве есть сухие тесты с заглушками awg/systemctl/nft:
+Автотесты запускаются так:
 
-  cd amneziawg_bundle
-  sudo ./tests/run_tests.sh
+  ./tests/run_tests.sh
 
-Тесты проверяют:
+В этой сборке проверяется:
 - bash -n всех скриптов;
-- append-only поведение sysctl/install.env;
-- создание awg0;
-- server MTU и DEFAULT_CLIENT_MTU;
-- nftables template для одного интерфейса: input policy drop, SSH allow, NAT;
-- добавление клиента IPv4-only с server-side IPv6 /128;
-- запрет перезаписи существующего awg0 даже при OVERWRITE_EXISTING_IFACE=yes;
-- создание awg1 без поломки awg0;
-- безопасное обновление существующего native nftables с redirect 53/443 без дублей;
-- добавление клиента именно в awg1;
-- единый мастер-скрипт --status.
+- установка через fake sources;
+- создание awg0 и awg1;
+- выбор следующих подсетей;
+- nftables template и обновление существующего native firewall без дублей;
+- добавление IPv4-only клиента по умолчанию;
+- явное добавление IPv6-клиента;
+- update с backup install.env;
+- status мастера;
+- удаление клиента и restore из backup;
+- удаление интерфейса, очистка nftables и restore из backup.
 
-См. также
----------
-- docs/CONFIG_GUIDE.txt
-- docs/TROUBLESHOOTING.txt
-- docs/CHANGES_AND_AUDIT.txt
-- scripts/README.txt
+Ограничения
+-----------
+- Автовыдача IPv4 рассчитана на /24.
+- Реальная DKMS-сборка зависит от ядра VPS, headers, Secure Boot и systemd. В контейнере проверяются только безопасные dry-run сценарии с заглушками.
+- Если nftables.conf имеет нестандартную структуру, скрипт остановится и напечатает ручные инструкции вместо рискованного изменения.

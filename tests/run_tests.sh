@@ -164,6 +164,22 @@ run_in_env() {
         QR_OUTPUT=no \
         NFT_SAVE_CHANGES="${NFT_SAVE_CHANGES:-ask}" \
         NFT_APPLY_NOW="${NFT_APPLY_NOW:-ask}" \
+        VPN_IF_DEFAULT="${VPN_IF_DEFAULT-}" \
+        OVERWRITE_EXISTING_IFACE="${OVERWRITE_EXISTING_IFACE-}" \
+        LISTEN_PORT_DEFAULT="${LISTEN_PORT_DEFAULT-}" \
+        SERVER_ADDR_V4_DEFAULT="${SERVER_ADDR_V4_DEFAULT-}" \
+        SERVER_ADDR_V6_DEFAULT="${SERVER_ADDR_V6_DEFAULT-}" \
+        ENABLE_IPV6_DEFAULT="${ENABLE_IPV6_DEFAULT-}" \
+        ENDPOINT_HOST_DEFAULT="${ENDPOINT_HOST_DEFAULT-}" \
+        SERVER_MTU_DEFAULT="${SERVER_MTU_DEFAULT-}" \
+        CLIENT_MTU_DEFAULT="${CLIENT_MTU_DEFAULT-}" \
+        CLIENT_MTU="${CLIENT_MTU-}" \
+        CLIENT_ENABLE_IPV6="${CLIENT_ENABLE_IPV6-}" \
+        CONFIRM_REMOVE="${CONFIRM_REMOVE-}" \
+        SKIP_FIREWALL_UPDATE="${SKIP_FIREWALL_UPDATE-}" \
+        RESTORE_APPLY_NFT="${RESTORE_APPLY_NFT-}" \
+        RESTORE_RESTART_SERVICES="${RESTORE_RESTART_SERVICES-}" \
+        RESTORE_CONFIRM="${RESTORE_CONFIRM-}" \
         "$script" "$@"
 }
 
@@ -190,9 +206,9 @@ pass "Подготовлены fake sources и заглушки"
 
 step "bash -n для всех скриптов"
 find "${BUNDLE_ROOT}/scripts" "${BUNDLE_ROOT}/sources" -maxdepth 1 -type f -name '*.sh' -print | while read -r file; do
-    bash -n "$file" || fail "Синтаксическая ошибка: $file"
+    bash -n "$file" </dev/null || fail "Синтаксическая ошибка: $file"
 done
-bash -n "${BUNDLE_ROOT}/install.sh" || fail "Синтаксическая ошибка: install.sh"
+bash -n "${BUNDLE_ROOT}/install.sh" </dev/null || fail "Синтаксическая ошибка: install.sh"
 pass "Все bash-скрипты проходят bash -n"
 
 step "Тест 01_install_from_source.sh append-only sysctl"
@@ -232,7 +248,7 @@ grep -q "AWG_QUICK_BIN='${SAFE_INSTALL_PREFIX}/libexec/amneziawg-bundle-tools/bi
 pass "01_install_from_source.sh ставит awg-tools в новый каталог и не меняет старые бинарники"
 
 step "Тест 02_create_server_config.sh для awg0"
-printf '\n\n\n\n89.124.86.140\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | run_in_env "${BUNDLE_ROOT}/scripts/02_create_server_config.sh"
+printf '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | run_in_env "${BUNDLE_ROOT}/scripts/02_create_server_config.sh"
 SERVER_CONF="${STATE_DIR}/awg0.conf"
 [[ -f "$SERVER_CONF" ]] || fail "server.conf не создан"
 grep -q '^Address = 10.8.1.1/24$' "$SERVER_CONF" || fail "В server.conf нет IPv4 Address"
@@ -263,9 +279,10 @@ grep -q '^# Address = fd42:42:42::2/128$' "$CLIENT_CONF" || fail "В client.conf
 grep -q '^AllowedIPs = 0.0.0.0/0$' "$CLIENT_CONF" || fail "В client.conf должен быть IPv4-only AllowedIPs по умолчанию"
 grep -q '^MTU = 1280$' "$CLIENT_CONF" || fail "В client.conf нет MTU клиента"
 grep -q '^# friendly_name=owner_phone$' "$SERVER_CONF" || fail "В server.conf нет friendly_name для клиента"
-grep -q '^AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128$' "$SERVER_CONF" || fail "В peer клиента нет IPv4+IPv6 AllowedIPs"
+grep -q '^AllowedIPs = 10.8.1.2/32$' "$SERVER_CONF" || fail "В peer клиента должен быть IPv4-only AllowedIPs по умолчанию"
+! grep -q '^AllowedIPs = 10.8.1.2/32, fd42:42:42::2/128$' "$SERVER_CONF" || fail "IPv6 /128 не должен добавляться в server.conf по умолчанию"
 find "${STATE_DIR}/backups" -type f -name 'awg0.conf' | grep -q . || fail "Не создан timestamp backup server.conf"
-pass "04_add_client.sh дописывает Grafana-friendly peer, резервирует IPv6 и создаёт client.conf"
+pass "04_add_client.sh дописывает Grafana-friendly peer, резервирует IPv6 комментарием и создаёт IPv4-only client.conf"
 
 step "Тест запрета перезаписи существующего интерфейса"
 SERVER_BEFORE="${TMP_ROOT}/awg0.before"
@@ -353,15 +370,15 @@ CLIENT_CONF_2="${STATE_DIR}/awg1/clients/phone2.conf"
 grep -q '^Address = 10.8.2.2/32$' "$CLIENT_CONF_2" || fail "Клиент awg1 получил неправильный IPv4"
 grep -q '^MTU = 1200$' "$CLIENT_CONF_2" || fail "Клиент awg1 не использует DEFAULT_CLIENT_MTU"
 grep -q '^# friendly_name=phone2$' "$SERVER_CONF_2" || fail "Peer awg1 не получил friendly_name"
-grep -q '^AllowedIPs = 10.8.2.2/32, fd42:42:43::2/128$' "$SERVER_CONF_2" || fail "Peer awg1 не добавлен с IPv4+IPv6 AllowedIPs"
+grep -q '^AllowedIPs = 10.8.2.2/32$' "$SERVER_CONF_2" || fail "Peer awg1 не добавлен с IPv4-only AllowedIPs по умолчанию"
 pass "04_add_client.sh добавляет клиента в выбранный интерфейс"
 
-step "Тест 05_update_amneziawg.sh append-only install.env"
+step "Тест 05_update_amneziawg.sh атомарно перезаписывает install.env с backup"
 printf '# install env sentinel before update\n' >> "$INSTALL_STATE_FILE"
 run_in_env "${BUNDLE_ROOT}/scripts/05_update_amneziawg.sh"
-grep -q '^# install env sentinel before update$' "$INSTALL_STATE_FILE" || fail "install.env был перезаписан при update"
-grep -q 'Appended by AmneziaWG bash bundle' "$INSTALL_STATE_FILE" || fail "install.env не получил append-only блок при update"
-pass "05_update_amneziawg.sh выполняется на заглушках и не перезаписывает install.env"
+! grep -q '^# install env sentinel before update$' "$INSTALL_STATE_FILE" || fail "install.env должен перезаписываться, а не дописываться"
+find "${STATE_DIR}/backups" -type f -name 'install.env' -exec grep -q '^# install env sentinel before update$' {} \; -print | grep -q . || fail "старый install.env не найден в backup"
+pass "05_update_amneziawg.sh выполняется на заглушках, перезаписывает install.env и сохраняет backup"
 
 step "Тест единого мастера --status"
 run_in_env "${BUNDLE_ROOT}/scripts/00_manage.sh" --status > "${TMP_ROOT}/status.txt"
@@ -369,5 +386,40 @@ grep -q 'Интерфейсы: 2' "${TMP_ROOT}/status.txt" || fail "00_manage --
 grep -q 'awg0' "${TMP_ROOT}/status.txt" || fail "00_manage --status не показывает awg0"
 grep -q 'awg1' "${TMP_ROOT}/status.txt" || fail "00_manage --status не показывает awg1"
 pass "00_manage.sh сканирует существующую установку"
+
+step "Тест явного IPv6 клиента на awg0"
+CLIENT_ENABLE_IPV6=yes CLIENT_MTU=1280 run_in_env "${BUNDLE_ROOT}/scripts/04_add_client.sh" ipv6_phone awg0
+IPV6_CLIENT_CONF="${STATE_DIR}/clients/ipv6_phone.conf"
+[[ -f "$IPV6_CLIENT_CONF" ]] || fail "IPv6-клиент не создан"
+grep -q '^Address = fd42:42:42::3/128$' "$IPV6_CLIENT_CONF" || fail "В IPv6 client.conf нет активного IPv6 Address"
+grep -q '^AllowedIPs = 0.0.0.0/0, ::/0$' "$IPV6_CLIENT_CONF" || fail "В IPv6 client.conf нет ::/0"
+grep -q '^AllowedIPs = 10.8.1.3/32, fd42:42:42::3/128$' "$SERVER_CONF" || fail "IPv6 /128 не добавлен в server.conf при CLIENT_ENABLE_IPV6=yes"
+pass "04_add_client.sh добавляет IPv6 /128 только при явном CLIENT_ENABLE_IPV6=yes"
+
+step "Тест удаления клиента и restore remove-client backup"
+CONFIRM_REMOVE=yes run_in_env "${BUNDLE_ROOT}/scripts/08_remove_client.sh" phone2 awg1
+[[ ! -f "$CLIENT_CONF_2" ]] || fail "client.conf phone2 не удалён"
+! grep -q '^# friendly_name=phone2$' "$SERVER_CONF_2" || fail "Peer phone2 не удалён из awg1.conf"
+REMOVE_CLIENT_BACKUP="$(find "${STATE_DIR}/backups" -maxdepth 1 -type d -name '*remove-client-awg1-phone2*' | sort | tail -n1)"
+[[ -n "$REMOVE_CLIENT_BACKUP" ]] || fail "Backup удаления клиента не найден"
+RESTORE_CONFIRM=yes RESTORE_APPLY_NFT=no RESTORE_RESTART_SERVICES=no run_in_env "${BUNDLE_ROOT}/scripts/10_restore_backup.sh" "$REMOVE_CLIENT_BACKUP"
+[[ -f "$CLIENT_CONF_2" ]] || fail "restore не вернул client.conf phone2"
+grep -q '^# friendly_name=phone2$' "$SERVER_CONF_2" || fail "restore не вернул peer phone2"
+pass "08_remove_client.sh удаляет клиента, а 10_restore_backup.sh возвращает его из backup"
+
+step "Тест удаления интерфейса awg1 с очисткой nftables и restore backup"
+CONFIRM_REMOVE=yes NFT_SAVE_CHANGES=yes NFT_APPLY_NOW=no run_in_env "${BUNDLE_ROOT}/scripts/09_remove_interface.sh" awg1
+[[ ! -f "$SERVER_CONF_2" ]] || fail "awg1.conf не удалён"
+[[ ! -d "${STATE_DIR}/awg1/clients" ]] || fail "clients dir awg1 не удалён"
+! grep -q 'awg1' "$NFTABLES_CONF" || fail "nftables всё ещё содержит awg1 после удаления интерфейса"
+! grep -q '520' "$NFTABLES_CONF" || fail "nftables всё ещё содержит порт 520 после удаления интерфейса"
+grep -q "VPN_IF='awg0'" "$MANAGER_ENV_FILE" || fail "manager.env не переключён на awg0"
+REMOVE_IFACE_BACKUP="$(find "${STATE_DIR}/backups" -maxdepth 1 -type d -name '*remove-interface-awg1*' | sort | tail -n1)"
+[[ -n "$REMOVE_IFACE_BACKUP" ]] || fail "Backup удаления интерфейса не найден"
+RESTORE_CONFIRM=yes RESTORE_APPLY_NFT=no RESTORE_RESTART_SERVICES=no run_in_env "${BUNDLE_ROOT}/scripts/10_restore_backup.sh" "$REMOVE_IFACE_BACKUP"
+[[ -f "$SERVER_CONF_2" ]] || fail "restore не вернул awg1.conf"
+[[ -f "$CLIENT_CONF_2" ]] || fail "restore не вернул клиента awg1"
+grep -q 'iifname { "awg0", "awg1" } oifname "ens3" masquerade' "$NFTABLES_CONF" || fail "restore не вернул NAT для awg1"
+pass "09_remove_interface.sh удаляет интерфейс и чистит firewall, а restore возвращает состояние"
 
 printf '\nИТОГ: все автоматические тесты завершились успешно.\n' | tee -a "$REPORT_FILE"

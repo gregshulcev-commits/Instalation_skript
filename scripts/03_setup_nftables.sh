@@ -9,36 +9,37 @@ SSH_PORT_DEFAULT="${SSH_PORT_DEFAULT:-22}"
 EXTERNAL_IF_DEFAULT="${EXTERNAL_IF_DEFAULT:-}"
 TARGET_VPN_IF="${TARGET_VPN_IF:-}"
 NFT_TABLE_NAME="${NFT_TABLE_NAME:-amneziawg_bundle}"
-NFT_APPLY_NOW="${NFT_APPLY_NOW:-ask}"   # yes|no|ask
+NFT_APPLY_NOW="${NFT_APPLY_NOW:-ask}"       # yes|no|ask
 NFT_SAVE_CHANGES="${NFT_SAVE_CHANGES:-ask}" # yes|no|ask
+ALLOW_NO_INTERFACES="${ALLOW_NO_INTERFACES:-no}"
+EXTRA_AWG_PORTS_TO_REMOVE="${EXTRA_AWG_PORTS_TO_REMOVE:-}"
+EXTRA_AWG_IFACES_TO_REMOVE="${EXTRA_AWG_IFACES_TO_REMOVE:-}"
 
 usage() {
     cat <<'EOF_USAGE'
 03_setup_nftables.sh
 
-Безопасно создаёт или обновляет nftables для всех найденных AmneziaWG интерфейсов:
+Пересобирает /etc/nftables.conf для всех найденных AmneziaWG интерфейсов:
   /etc/amnezia/amneziawg/*.conf
 
-Новая логика безопасности:
-  - если /etc/nftables.conf отсутствует или пустой, создаётся чистый template:
-      table inet filter с input policy drop, SSH allow, loopback/established/ICMP, AWG UDP ports;
-      table inet nat с IPv4 masquerade для всех awgN;
-  - если уже есть table inet filter и table inet nat, скрипт пытается аккуратно обновить существующий формат:
-      не добавляет вторую input-chain;
-      не добавляет отдельную table ip amneziawg_bundle рядом с рабочим firewall;
-      сохраняет существующие redirect/DNAT правила;
-      объединяет AWG UDP ports и AWG ifaces в красивые set-выражения;
-  - если формат firewall непонятен, автоматическое изменение не выполняется: печатаются ручные строки;
-  - перед изменением существующего nftables.conf создаётся timestamp backup в STATE_DIR/backups/...;
-  - глобальный flush ruleset не используется;
-  - awg0/awg1 services не перезапускаются из firewall-скрипта.
+Логика этой версии:
+  - файл nftables.conf перезаписывается итоговым candidate, а не дописывается;
+  - перед перезаписью создаётся timestamp backup с MANIFEST.tsv;
+  - итоговый файл начинается с `flush ruleset`, поэтому `nft -f /etc/nftables.conf` заменяет runtime ruleset, а не наслаивает правила;
+  - в table inet filter/input базовые правила loopback/established/SSH/ICMP нормализуются и не дублируются;
+  - AWG UDP-порты объединяются в одно правило вида `iifname "ens3" udp dport { ... } accept`;
+  - NAT masquerade объединяется в одно правило вида `iifname { "awg0", "awg1" } oifname "ens3" masquerade`;
+  - существующие пользовательские правила, например redirect UDP 53/443 или доступ к Grafana с awg0, сохраняются;
+  - старые table ip amneziawg_bundle удаляются из candidate.
 
 Переменные:
-  TARGET_VPN_IF=awg1             - оставить для совместимости; service не перезапускается
   EXTERNAL_IF_DEFAULT=ens3
   SSH_PORT_DEFAULT=22
-  NFT_APPLY_NOW=yes|no|ask       - применять nft rules сразу или только сохранить файл
-  NFT_SAVE_CHANGES=yes|no|ask    - сохранить candidate без интерактивного вопроса
+  NFT_APPLY_NOW=yes|no|ask
+  NFT_SAVE_CHANGES=yes|no|ask
+  ALLOW_NO_INTERFACES=yes       - разрешить очистку AWG-правил, если интерфейсов больше нет (используется удалением интерфейса)
+  EXTRA_AWG_PORTS_TO_REMOVE=520 - дополнительные старые порты для удаления из ruleset
+  EXTRA_AWG_IFACES_TO_REMOVE=awg1 - дополнительные старые ifaces для удаления из NAT
 EOF_USAGE
 }
 
@@ -62,6 +63,22 @@ collect_interfaces() {
     done < <(list_awg_interfaces_from_confs)
 }
 
+csv_unique_append() {
+    local base="${1:-}"
+    local extra="${2:-}"
+    local out="" item seen=""
+    for item in ${base//,/ } ${extra//,/ }; do
+        item="${item//[[:space:]]/}"
+        [[ -n "$item" ]] || continue
+        if grep -qxF "$item" <<< "$seen" 2>/dev/null; then
+            continue
+        fi
+        seen="${seen}"$'\n'"${item}"
+        if [[ -z "$out" ]]; then out="$item"; else out="${out},${item}"; fi
+    done
+    printf '%s\n' "$out"
+}
+
 pairs_to_csv() {
     local pairs="$1"
     local field="$2"
@@ -83,31 +100,34 @@ pairs_to_csv() {
             out="${out},${value}"
         fi
     done <<< "$pairs"
-    [[ -n "$out" ]] || die "Не найден ни один AWG конфиг с ListenPort в $STATE_DIR/*.conf"
     printf '%s\n' "$out"
 }
 
 csv_to_nft_ports() {
     local csv="$1"
     local out="" item
+    [[ -n "$csv" ]] || return 1
     IFS=',' read -r -a _items <<< "$csv"
     for item in "${_items[@]}"; do
         item="${item//[[:space:]]/}"
         [[ -n "$item" ]] || continue
         if [[ -z "$out" ]]; then out="$item"; else out="$out, $item"; fi
     done
+    [[ -n "$out" ]] || return 1
     printf '{ %s }' "$out"
 }
 
 csv_to_nft_ifaces() {
     local csv="$1"
     local out="" item
+    [[ -n "$csv" ]] || return 1
     IFS=',' read -r -a _items <<< "$csv"
     for item in "${_items[@]}"; do
         item="${item//[[:space:]]/}"
         [[ -n "$item" ]] || continue
         if [[ -z "$out" ]]; then out="\"$item\""; else out="$out, \"$item\""; fi
     done
+    [[ -n "$out" ]] || return 1
     printf '{ %s }' "$out"
 }
 
@@ -117,11 +137,13 @@ generate_native_template() {
     local ports_csv="$3"
     local ifaces_csv="$4"
     local ports_set ifaces_set
-    ports_set="$(csv_to_nft_ports "$ports_csv")"
-    ifaces_set="$(csv_to_nft_ifaces "$ifaces_csv")"
+    ports_set="$(csv_to_nft_ports "$ports_csv" 2>/dev/null || true)"
+    ifaces_set="$(csv_to_nft_ifaces "$ifaces_csv" 2>/dev/null || true)"
     cat <<EOF_RULES
+flush ruleset
+
 # Generated by AmneziaWG bash bundle.
-# Safe nftables template: default input policy is drop, SSH is explicitly allowed.
+# Full ruleset is regenerated from current AWG configs; old AWG duplicates are not appended.
 
 table inet filter {
         chain input {
@@ -130,7 +152,11 @@ table inet filter {
                 ct state established,related accept
                 tcp dport ${ssh_port} accept
                 ip protocol icmp icmp type { echo-reply, destination-unreachable, echo-request, time-exceeded, parameter-problem } accept
-                iifname "${ext_if}" udp dport ${ports_set} accept
+EOF_RULES
+    if [[ -n "$ports_set" ]]; then
+        printf '                iifname "%s" udp dport %s accept\n' "$ext_if" "$ports_set"
+    fi
+    cat <<'EOF_RULES'
         }
 
         chain forward {
@@ -145,7 +171,11 @@ table inet filter {
 table inet nat {
         chain postrouting {
                 type nat hook postrouting priority srcnat; policy accept;
-                iifname ${ifaces_set} oifname "${ext_if}" masquerade
+EOF_RULES
+    if [[ -n "$ifaces_set" ]]; then
+        printf '                iifname %s oifname "%s" masquerade\n' "$ifaces_set" "$ext_if"
+    fi
+    cat <<'EOF_RULES'
         }
 }
 EOF_RULES
@@ -158,43 +188,44 @@ render_native_update() {
     local ssh_port="$4"
     local ports_csv="$5"
     local ifaces_csv="$6"
+    local remove_ports_csv="$7"
+    local remove_ifaces_csv="$8"
 
     command -v python3 >/dev/null 2>&1 || return 41
-    python3 - "$src" "$dst" "$ext_if" "$ssh_port" "$ports_csv" "$ifaces_csv" "$NFT_TABLE_NAME" <<'PY'
+    python3 -S - "$src" "$dst" "$ext_if" "$ssh_port" "$ports_csv" "$ifaces_csv" "$remove_ports_csv" "$remove_ifaces_csv" "$NFT_TABLE_NAME" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-src, dst, ext_if, ssh_port, ports_csv, ifaces_csv, table_name = sys.argv[1:]
+src, dst, ext_if, ssh_port, ports_csv, ifaces_csv, remove_ports_csv, remove_ifaces_csv, table_name = sys.argv[1:]
 text = Path(src).read_text()
 ports = [p.strip() for p in ports_csv.split(',') if p.strip()]
 ifaces = [i.strip() for i in ifaces_csv.split(',') if i.strip()]
-ports_set = '{ ' + ', '.join(ports) + ' }'
-ifaces_set = '{ ' + ', '.join(f'"{i}"' for i in ifaces) + ' }'
+remove_ports = set(p.strip() for p in remove_ports_csv.split(',') if p.strip()) | set(ports)
+remove_ifaces = set(i.strip() for i in remove_ifaces_csv.split(',') if i.strip()) | set(ifaces)
+ports_set = '{ ' + ', '.join(ports) + ' }' if ports else ''
+ifaces_set = '{ ' + ', '.join(f'"{i}"' for i in ifaces) + ' }' if ifaces else ''
+
+
+def ensure_flush_ruleset(s: str) -> str:
+    s = re.sub(r'(?m)^\s*flush\s+ruleset\s*\n+', '', s)
+    return 'flush ruleset\n\n' + s.lstrip('\n')
 
 
 def find_block(s, pattern, start=0, end=None):
-    """Find nft table/chain/set blocks by structural lines.
-
-    nft rules often contain inline sets such as { 53, 443 }. A character-level
-    brace counter mistakes those for block braces, so we count only structural
-    open lines (table/chain/set ... {) and standalone close-brace lines.
-    """
     limit = len(s) if end is None else end
     lines = []
     pos = start
     for line in s[start:limit].splitlines(True):
         lines.append((pos, line))
         pos += len(line)
-
     start_idx = None
     for idx, (_pos, line) in enumerate(lines):
-        if re.search(pattern, line, re.M):
+        if re.search(pattern, line):
             start_idx = idx
             break
     if start_idx is None:
         return None
-
     depth = 0
     block_start = lines[start_idx][0]
     for idx in range(start_idx, len(lines)):
@@ -221,7 +252,6 @@ def remove_table_ip_bundle(s):
         if not block:
             return s, changed
         a, b = block
-        # Remove nearby empty lines after the bundle-owned table for a clean file.
         while b < len(s) and s[b] in ' \t\r\n':
             if s[b] == '\n':
                 b += 1
@@ -238,9 +268,12 @@ def line_ports(line):
     return set(re.findall(r'(?<!\d)(\d{1,5})(?!\d)', m.group(1)))
 
 
-def line_is_only_awg_ports(line):
+def line_is_awg_port_rule(line):
     nums = line_ports(line)
-    return bool(nums) and any(p in nums for p in ports) and nums.issubset(set(ports))
+    if not nums or not remove_ports:
+        return False
+    return (f'iifname "{ext_if}"' in line and 'udp' in line and 'dport' in line
+            and 'accept' in line and nums.issubset(remove_ports))
 
 
 def iifaces_in_line(line):
@@ -253,9 +286,11 @@ def iifaces_in_line(line):
     return []
 
 
-def line_is_only_awg_iifaces(line):
+def line_is_awg_nat_rule(line):
     names = set(iifaces_in_line(line))
-    return bool(names) and any(i in names for i in ifaces) and names.issubset(set(ifaces))
+    if not names or not remove_ifaces:
+        return False
+    return 'masquerade' in line and f'oifname "{ext_if}"' in line and names.issubset(remove_ifaces)
 
 
 def replace_block(s, block, new_block):
@@ -263,88 +298,87 @@ def replace_block(s, block, new_block):
     return s[:a] + new_block + s[b:]
 
 
+def is_base_input_rule(stripped):
+    if stripped in {'iif "lo" accept', "iif 'lo' accept"}:
+        return True
+    if stripped == 'ct state established,related accept':
+        return True
+    if re.fullmatch(rf'tcp\s+dport\s+(?:\{{[^}}]*\b{re.escape(ssh_port)}\b[^}}]*\}}|{re.escape(ssh_port)})\s+accept', stripped):
+        return True
+    if 'ip protocol icmp' in stripped and 'accept' in stripped:
+        return True
+    return False
+
+
 def update_input_chain(chain):
     if 'policy drop' not in chain:
         raise RuntimeError('input chain policy is not drop; refusing to change policy automatically')
     lines = chain.splitlines()
     new_lines = []
-    removed_vpn = False
-    has_ssh = False
+    seen_rules = set()
+    hook_idx = None
     for line in lines:
-        if re.search(rf'\btcp\s+dport\s+(?:\{{[^}}]*\b{re.escape(ssh_port)}\b[^}}]*\}}|{re.escape(ssh_port)})\s+accept\b', line):
-            has_ssh = True
-        if (f'iifname "{ext_if}"' in line and 'udp' in line and 'dport' in line
-                and 'accept' in line and line_is_only_awg_ports(line)):
-            if not removed_vpn:
-                removed_vpn = True
-            continue
-        new_lines.append(line)
-
-    indent = '                '
-    for line in new_lines:
+        stripped = line.strip()
         if 'type filter hook input' in line:
-            indent = re.match(r'^(\s*)', line).group(1)
-            break
-    ssh_line = f'{indent}tcp dport {ssh_port} accept'
-    vpn_line = f'{indent}iifname "{ext_if}" udp dport {ports_set} accept'
-
-    # Insert after the SSH allow rule when possible. If SSH was missing, insert SSH + VPN
-    # after established/related, loopback, or the hook line.
-    insert_at = None
-    if has_ssh:
-        for idx, line in enumerate(new_lines):
-            if re.search(rf'\btcp\s+dport\s+(?:\{{[^}}]*\b{re.escape(ssh_port)}\b[^}}]*\}}|{re.escape(ssh_port)})\s+accept\b', line):
-                insert_at = idx + 1
-        new_lines.insert(insert_at, vpn_line)
-    else:
-        for idx, line in enumerate(new_lines):
-            if 'ct state established,related accept' in line:
-                insert_at = idx + 1
-        if insert_at is None:
-            for idx, line in enumerate(new_lines):
-                if 'iif "lo" accept' in line or "iif 'lo' accept" in line:
-                    insert_at = idx + 1
-        if insert_at is None:
-            for idx, line in enumerate(new_lines):
-                if 'type filter hook input' in line:
-                    insert_at = idx + 1
-                    break
-        if insert_at is None:
-            raise RuntimeError('cannot find safe insertion point in input chain')
-        new_lines.insert(insert_at, ssh_line)
-        new_lines.insert(insert_at + 1, vpn_line)
-
+            hook_idx = len(new_lines)
+            new_lines.append(line)
+            continue
+        if is_base_input_rule(stripped):
+            continue
+        if line_is_awg_port_rule(line):
+            continue
+        # Deduplicate exact remaining rules inside the chain, but keep braces/comments readable.
+        if stripped and not stripped.startswith('#') and stripped not in {'chain input {', '}'}:
+            key = re.sub(r'\s+', ' ', stripped)
+            if key in seen_rules:
+                continue
+            seen_rules.add(key)
+        new_lines.append(line)
+    if hook_idx is None:
+        raise RuntimeError('cannot find hook line in input chain')
+    indent = re.match(r'^(\s*)', new_lines[hook_idx]).group(1)
+    canonical = [
+        f'{indent}iif "lo" accept',
+        f'{indent}ct state established,related accept',
+        f'{indent}tcp dport {ssh_port} accept',
+        f'{indent}ip protocol icmp icmp type {{ echo-reply, destination-unreachable, echo-request, time-exceeded, parameter-problem }} accept',
+    ]
+    if ports:
+        canonical.append(f'{indent}iifname "{ext_if}" udp dport {ports_set} accept')
+    for offset, line in enumerate(canonical, 1):
+        new_lines.insert(hook_idx + offset, line)
     return '\n'.join(new_lines) + ('\n' if chain.endswith('\n') else '')
 
 
 def update_postrouting_chain(chain):
     lines = chain.splitlines()
     new_lines = []
-    removed_nat = False
+    seen_rules = set()
+    hook_idx = None
     for line in lines:
-        if ('masquerade' in line and f'oifname "{ext_if}"' in line and line_is_only_awg_iifaces(line)):
-            removed_nat = True
+        stripped = line.strip()
+        if 'type nat hook postrouting' in line:
+            hook_idx = len(new_lines)
+            new_lines.append(line)
             continue
+        if line_is_awg_nat_rule(line):
+            continue
+        if stripped and not stripped.startswith('#') and stripped not in {'chain postrouting {', '}'}:
+            key = re.sub(r'\s+', ' ', stripped)
+            if key in seen_rules:
+                continue
+            seen_rules.add(key)
         new_lines.append(line)
-    indent = '                '
-    for line in new_lines:
-        if 'type nat hook postrouting' in line:
-            indent = re.match(r'^(\s*)', line).group(1)
-            break
-    nat_line = f'{indent}iifname {ifaces_set} oifname "{ext_if}" masquerade'
-    insert_at = None
-    for idx, line in enumerate(new_lines):
-        if 'type nat hook postrouting' in line:
-            insert_at = idx + 1
-            break
-    if insert_at is None:
-        raise RuntimeError('cannot find safe insertion point in postrouting chain')
-    new_lines.insert(insert_at, nat_line)
+    if hook_idx is None:
+        raise RuntimeError('cannot find hook line in postrouting chain')
+    if ifaces:
+        indent = re.match(r'^(\s*)', new_lines[hook_idx]).group(1)
+        new_lines.insert(hook_idx + 1, f'{indent}iifname {ifaces_set} oifname "{ext_if}" masquerade')
     return '\n'.join(new_lines) + ('\n' if chain.endswith('\n') else '')
 
 
 try:
-    text, removed_bundle = remove_table_ip_bundle(text)
+    text, _removed_bundle = remove_table_ip_bundle(text)
     filter_table = find_block(text, r'^[ \t]*table[ \t]+inet[ \t]+filter[ \t]*\{')
     nat_table = find_block(text, r'^[ \t]*table[ \t]+inet[ \t]+nat[ \t]*\{')
     if not filter_table or not nat_table:
@@ -360,13 +394,13 @@ try:
     new_input = update_input_chain(old_input)
     text = replace_block(text, input_chain, new_input)
 
-    # Recalculate blocks after changing text length.
     nat_table = find_block(text, r'^[ \t]*table[ \t]+inet[ \t]+nat[ \t]*\{')
     post_chain = find_block(text, r'^[ \t]*chain[ \t]+postrouting[ \t]*\{', nat_table[0], nat_table[1])
     old_post = text[post_chain[0]:post_chain[1]]
     new_post = update_postrouting_chain(old_post)
     text = replace_block(text, post_chain, new_post)
 
+    text = ensure_flush_ruleset(text)
     Path(dst).write_text(text.rstrip() + '\n')
 except Exception as exc:
     print(str(exc), file=sys.stderr)
@@ -381,8 +415,8 @@ print_manual_nft_instructions() {
     local ports_csv="$4"
     local ifaces_csv="$5"
     local ports_set ifaces_set
-    ports_set="$(csv_to_nft_ports "$ports_csv")"
-    ifaces_set="$(csv_to_nft_ifaces "$ifaces_csv")"
+    ports_set="$(csv_to_nft_ports "$ports_csv" 2>/dev/null || true)"
+    ifaces_set="$(csv_to_nft_ifaces "$ifaces_csv" 2>/dev/null || true)"
     warn "Автоматически менять nftables небезопасно: ${reason}"
     cat <<EOF_MANUAL
 
@@ -392,19 +426,29 @@ print_manual_nft_instructions() {
    sudo mkdir -p /etc/amnezia/amneziawg/backups/$(date +%Y%m%d-%H%M%S)-manual-nftables
    sudo cp -a ${NFTABLES_CONF} /etc/amnezia/amneziawg/backups/$(date +%Y%m%d-%H%M%S)-manual-nftables/
 
-2) В существующей table inet filter / chain input убедитесь, что policy drop и SSH разрешён:
-   type filter hook input priority filter; policy drop;
+2) Уберите дубли старых AWG-правил из table inet filter / chain input.
+3) Убедитесь, что базовые правила есть ровно один раз:
+   iif "lo" accept
+   ct state established,related accept
    tcp dport ${ssh_port} accept
+   ip protocol icmp ... accept
+EOF_MANUAL
+    if [[ -n "$ports_set" ]]; then
+        printf '4) Добавьте единое правило AWG UDP:\n   iifname "%s" udp dport %s accept\n' "$ext_if" "$ports_set"
+    else
+        printf '4) AWG интерфейсов больше нет: удалите старые AWG UDP allow rules.\n'
+    fi
+    if [[ -n "$ifaces_set" ]]; then
+        printf '5) Добавьте единый NAT masquerade:\n   iifname %s oifname "%s" masquerade\n' "$ifaces_set" "$ext_if"
+    else
+        printf '5) AWG интерфейсов больше нет: удалите старые AWG masquerade rules.\n'
+    fi
+    cat <<EOF_MANUAL
 
-3) В эту же chain input добавьте или объедините AWG UDP ports:
-   iifname "${ext_if}" udp dport ${ports_set} accept
+6) Для применения без наслаивания правил файл должен начинаться с:
+   flush ruleset
 
-4) В существующей table inet nat / chain postrouting добавьте или объедините masquerade:
-   iifname ${ifaces_set} oifname "${ext_if}" masquerade
-
-5) Существующие redirect/DNAT правила, например UDP 53/443 -> 56789, не трогайте, если они нужны для awg0.
-
-6) Проверьте и примените:
+7) Проверьте и примените:
    sudo nft -c -f ${NFTABLES_CONF}
    sudo nft -f ${NFTABLES_CONF}
 
@@ -425,7 +469,7 @@ confirm_env() {
 }
 
 main() {
-    local ext_if ssh_port pairs ports_csv ifaces_csv mode candidate backup_dir backup_path had_old_bundle="no" render_error=""
+    local ext_if ssh_port pairs ports_csv ifaces_csv remove_ports_csv remove_ifaces_csv mode candidate backup_dir backup_path had_old_bundle="no" render_error=""
 
     require_root
     require_cmd nft
@@ -438,9 +482,16 @@ main() {
     ssh_port="$(prompt_until_valid "SSH порт" "${SSH_PORT_DEFAULT:-${SSH_PORT:-22}}" validate_port)"
 
     pairs="$(collect_interfaces)"
-    [[ -n "$pairs" ]] || die "Не найден ни один серверный конфиг AWG в $STATE_DIR/*.conf"
     ports_csv="$(pairs_to_csv "$pairs" ports)"
     ifaces_csv="$(pairs_to_csv "$pairs" ifaces)"
+    if [[ -z "$pairs" && "$(normalise_yes_no "$ALLOW_NO_INTERFACES" 2>/dev/null || printf no)" != "yes" ]]; then
+        die "Не найден ни один серверный конфиг AWG в $STATE_DIR/*.conf"
+    fi
+
+    remove_ports_csv="$(csv_unique_append "${AWG_PORTS:-}" "$EXTRA_AWG_PORTS_TO_REMOVE")"
+    remove_ports_csv="$(csv_unique_append "$remove_ports_csv" "$ports_csv")"
+    remove_ifaces_csv="$(csv_unique_append "${AWG_IFACES:-}" "$EXTRA_AWG_IFACES_TO_REMOVE")"
+    remove_ifaces_csv="$(csv_unique_append "$remove_ifaces_csv" "$ifaces_csv")"
 
     candidate="$(mktemp)"
     if [[ ! -e "$NFTABLES_CONF" || ! -s "$NFTABLES_CONF" ]]; then
@@ -453,7 +504,7 @@ main() {
     elif grep -qE '^[[:space:]]*table[[:space:]]+inet[[:space:]]+filter' "$NFTABLES_CONF" && grep -qE '^[[:space:]]*table[[:space:]]+inet[[:space:]]+nat' "$NFTABLES_CONF"; then
         mode="update-existing-inet"
         grep -q "table ip ${NFT_TABLE_NAME}" "$NFTABLES_CONF" && had_old_bundle="yes"
-        if ! render_native_update "$NFTABLES_CONF" "$candidate" "$ext_if" "$ssh_port" "$ports_csv" "$ifaces_csv" 2>"${candidate}.err"; then
+        if ! render_native_update "$NFTABLES_CONF" "$candidate" "$ext_if" "$ssh_port" "$ports_csv" "$ifaces_csv" "$remove_ports_csv" "$remove_ifaces_csv" 2>"${candidate}.err"; then
             render_error="$(cat "${candidate}.err" 2>/dev/null || true)"
             print_manual_nft_instructions "${render_error:-не удалось распознать структуру table inet filter/nat}" "$ext_if" "$ssh_port" "$ports_csv" "$ifaces_csv"
             rm -f "$candidate" "${candidate}.err"
@@ -465,7 +516,11 @@ main() {
         exit 2
     fi
 
-    printf '\nНайдены AWG интерфейсы и порты:\n%s\n' "$pairs"
+    if [[ -n "$pairs" ]]; then
+        printf '\nНайдены AWG интерфейсы и порты:\n%s\n' "$pairs"
+    else
+        printf '\nAWG интерфейсов не найдено; candidate очистит старые AWG allow/NAT rules, если они были известны из firewall.env.\n'
+    fi
     printf '\nРежим nftables: %s\n' "$mode"
     printf '\nПредварительный просмотр итогового %s:\n\n' "$NFTABLES_CONF"
     cat "$candidate"
@@ -474,8 +529,8 @@ main() {
     ok "Синтаксис nftables корректный"
 
     if confirm_env "$NFT_SAVE_CHANGES" "Сохранить этот nftables.conf с timestamp-backup старого файла?" Y; then
+        backup_dir="$(create_timestamped_backup_dir nftables)"
         if [[ -e "$NFTABLES_CONF" ]]; then
-            backup_dir="$(create_timestamped_backup_dir nftables)"
             backup_path="$(backup_file_to_dir "$NFTABLES_CONF" "$backup_dir")"
             warn "Backup nftables.conf: $backup_path"
         else
@@ -483,27 +538,25 @@ main() {
         fi
         cp -- "$candidate" "$NFTABLES_CONF"
         chmod 644 "$NFTABLES_CONF"
-        write_firewall_env "$FIREWALL_ENV_FILE" "$ext_if" "$ssh_port"
+        AWG_ACTIVE_BACKUP_DIR="$backup_dir"
+        write_firewall_env "$FIREWALL_ENV_FILE" "$ext_if" "$ssh_port" "$ports_csv" "$ifaces_csv"
+        AWG_ACTIVE_BACKUP_DIR=""
         ok "Файл сохранён: $NFTABLES_CONF"
-        ok "Параметры firewall сохранены append-only в $FIREWALL_ENV_FILE"
+        ok "firewall.env перезаписан: $FIREWALL_ENV_FILE"
+        ok "Backup папка: $backup_dir"
     else
         warn "Файл не сохранён; изменения не применялись"
         rm -f "$candidate" "${candidate}.err"
         exit 0
     fi
 
-    if [[ "$mode" == "update-existing-inet" ]]; then
-        printf '\nДля существующего firewall применение через nft -f может зависеть от runtime-состояния nftables.\n'
-        printf 'Если хотите максимальную осторожность, ответьте N и примените вручную после проверки файла.\n'
-    fi
-
-    if confirm_env "$NFT_APPLY_NOW" "Применить сохранённые правила сейчас и включить nftables в автозагрузку?" "$( [[ "$mode" == "update-existing-inet" ]] && printf N || printf Y )"; then
+    if confirm_env "$NFT_APPLY_NOW" "Применить сохранённые правила сейчас и включить nftables в автозагрузку?" Y; then
         if [[ "$had_old_bundle" == "yes" ]]; then
             nft delete table ip "$NFT_TABLE_NAME" 2>/dev/null || true
         fi
         nft -f "$NFTABLES_CONF"
         systemctl enable --now nftables
-        ok "nftables применён"
+        ok "nftables применён через full ruleset reload"
     else
         warn "nftables не применялся автоматически. Применить вручную: sudo nft -c -f ${NFTABLES_CONF} && sudo nft -f ${NFTABLES_CONF}"
     fi

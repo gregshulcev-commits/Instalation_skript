@@ -1,118 +1,102 @@
 CHANGES_AND_AUDIT
 =================
 
-Что было найдено при анализе исходников
----------------------------------------
+Ключевые найденные проблемы
+---------------------------
 
-1. Не было единого безопасного входа.
-   Старый scripts/06_run_all.sh всегда выполнял сценарий первого запуска, а добавление интерфейса было вынесено в scripts/07_add_interface.sh. Пользователь мог случайно пойти не тем путём.
-
-   Исправлено:
-   - добавлен scripts/00_manage.sh;
-   - добавлен root wrapper install.sh;
-   - 06_run_all.sh оставлен только как wrapper на 00_manage.sh.
-
-2. Добавление второго интерфейса было отдельным сценарием, но не было полноценного сканирования состояния.
+1. Новые клиенты автоматически получали IPv6 /128 в server.conf AllowedIPs.
+   Это заставляло awg-quick выполнять `ip -6 route add ... dev awgN`. В сочетании с MTU 800 и/или неполной IPv6-схемой интерфейс мог падать при поднятии.
 
    Исправлено:
-   - 00_manage.sh показывает awg/awg-quick, модуль, sysctl, nftables, все *.conf, порты, MTU, клиентов и service state;
-   - на основе состояния предлагает следующий шаг.
+   - по умолчанию server peer получает только IPv4 /32;
+   - IPv6 /128 добавляется только при CLIENT_ENABLE_IPV6=yes;
+   - IPv6 + MTU < 1280 запрещён.
 
-3. MTU клиента нельзя было нормально задать интерактивно при создании интерфейса.
-   Старый 04_add_client.sh брал CLIENT_MTU только из переменной окружения.
-
-   Исправлено:
-   - 02_create_server_config.sh спрашивает server MTU и default client MTU;
-   - DEFAULT_CLIENT_MTU сохраняется в manager-<iface>.env;
-   - 04_add_client.sh спрашивает MTU клиента и по умолчанию берёт DEFAULT_CLIENT_MTU.
-
-4. Для awg0 была неоднозначность layout папок clients/keys.
-   В предыдущей multi-interface версии новый awg0 мог получить /etc/amnezia/amneziawg/awg0/clients, хотя README и тесты ожидали /etc/amnezia/amneziawg/clients.
+2. nftables обновлялся дозаписью, из-за чего появлялись дубли базовых input-правил, UDP allow и NAT masquerade.
 
    Исправлено:
-   - для awg0 по умолчанию используется совместимый layout /keys и /clients;
-   - если у пользователя уже существует старый nested layout awg0/clients, скрипт его не ломает и продолжает использовать.
+   - 03_setup_nftables.sh строит итоговый candidate и перезаписывает nftables.conf с backup;
+   - итоговый файл начинается с flush ruleset;
+   - AWG UDP ports и AWG masquerade объединяются;
+   - старая table ip amneziawg_bundle удаляется из candidate;
+   - пользовательские redirect/DNAT/Grafana rules сохраняются при понятной структуре firewall.
 
-5. 04_add_client.sh при нескольких интерфейсах мог добавить клиента не туда, если пользователь не указал interface, потому что manager.env указывает только на последний интерфейс.
-
-   Исправлено:
-   - если интерфейсов несколько и interface не указан, 04_add_client.sh предлагает выбрать интерфейс;
-   - 00_manage.sh всегда ведёт через выбор интерфейса.
-
-6. 05_update_amneziawg.sh перезапускал только service из manager.env.
-   При нескольких интерфейсах это мог быть только последний интерфейс.
+3. manager/install/firewall env файлы раньше могли разрастаться append-блоками.
 
    Исправлено:
-   - 05_update_amneziawg.sh теперь сканирует все *.conf и перезапускает все найденные awg-quick@<iface>.service.
+   - install.env, manager.env, manager-IFACE.env, firewall.env перезаписываются атомарно;
+   - перед перезаписью создаётся timestamp backup.
 
-7. generate_server_keys_if_needed пересоздавал приватный ключ, если server_private.key был, а server_public.key отсутствовал.
-   Это могло неожиданно сменить ключ сервера.
-
-   Исправлено:
-   - если private key есть, а public key потерян, public key восстанавливается из private key.
-
-8. Не хватало валидации пользовательских значений.
+4. Не было полноценного rollback/restore механизма.
 
    Исправлено:
-   - добавлена проверка имени интерфейса;
-   - проверка UDP/SSH портов;
-   - проверка MTU;
-   - проверка IPv4 /24;
-   - проверка IPv6 /64 ULA-формата;
-   - проверка числовых AWG параметров.
+   - добавлены transaction helpers в 00_common.sh;
+   - операции создания/добавления/удаления создают backup с MANIFEST.tsv;
+   - Ctrl+C/ошибка удаляет новые файлы и восстанавливает старые;
+   - добавлен 10_restore_backup.sh.
 
-9. nftables раньше мог добавлять отдельную table/chain рядом с существующим firewall.
-   На сервере с уже настроенными table inet filter/table inet nat это приводило к дублям input/postrouting и не всегда открывало новый порт при policy drop.
+5. Не было удаления клиента и интерфейса.
 
    Исправлено:
-   - глобальный flush ruleset больше не используется;
-   - если nftables.conf отсутствует или пустой, создаётся безопасный template с table inet filter, input policy drop, SSH allow и table inet nat;
-   - если уже есть понятная table inet filter + table inet nat, скрипт обновляет существующие chain input/postrouting без создания второй input-chain;
-   - redirect/DNAT правила, например UDP 53/443 -> 56789, сохраняются;
-   - старый bundle-owned table ip amneziawg_bundle удаляется из candidate, если рядом есть native filter/nat;
-   - перед изменением существующего nftables.conf создаётся timestamp-backup в STATE_DIR/backups;
-   - если структура firewall непонятна, автоматическое изменение не выполняется, печатаются ручные инструкции;
-   - firewall.env сохраняет внешний интерфейс и SSH-порт append-only;
-   - awg services из firewall-скрипта больше не перезапускаются.
+   - добавлен 08_remove_client.sh;
+   - добавлен 09_remove_interface.sh;
+   - пункты добавлены в 00_manage.sh.
 
-10. Клиентские конфиги по умолчанию включали ::/0 при закомментированном IPv6 Address.
-    Это может быть нежелательно на серверах без полноценного IPv6.
+6. Defaults были неудобны.
 
-    Исправлено:
-    - server.conf теперь всегда получает IPv4+IPv6 AllowedIPs для peer: 10.8.X.Y/32, fd42:...::Y/128;
-    - client.conf по умолчанию остаётся IPv4-only: Address IPv6 закомментирован, AllowedIPs = 0.0.0.0/0;
-    - IPv6-маршрутизация в client.conf включается явно через CLIENT_ENABLE_IPV6=yes или интерактивный вопрос.
+   Исправлено:
+   - следующий IPv4 default выбирается по существующим *.conf;
+   - IPv6 default синхронизирован с IPv4;
+   - endpoint host default берётся из `ip -4 route get 1.1.1.1` source address;
+   - добавлены подсказки по obfuscation-параметрам.
 
-11. Тесты не покрывали добавление второго интерфейса и выбор интерфейса при добавлении клиента.
+7. 05_update_amneziawg.sh работал только с одним текущим интерфейсом.
 
-    Исправлено:
-    - tests/run_tests.sh теперь проверяет awg0, awg1, DEFAULT_CLIENT_MTU, 00_manage.sh --status;
-    - проверяется безопасный nftables template для пустого firewall;
-    - проверяется обновление существующего native nftables с redirect 53/443 и удалением старой bundle-table из candidate;
-    - проверяется Grafana-friendly peer format с # friendly_name=... и IPv6 /128 в server AllowedIPs.
+   Исправлено:
+   - update сканирует все *.conf и обрабатывает все awg-quick@IFACE.service.
 
-12. Найдена опасность перезаписи старых данных в state/env/sysctl/server/nftables/cache/DKMS путях.
+8. Тесты не покрывали важные сценарии.
 
-    Исправлено:
-    - install.env, manager.env, firewall.env обновляются append-only;
-    - sysctl-ключ не редактируется через sed -i, а дописывается новым значением в конец;
-    - повторное создание существующего интерфейса запрещено;
-    - ключи сервера не перезаписываются, неполные ключи требуют ручной проверки;
-    - клиентский conf создаётся только если файла ещё нет;
-    - server.conf при добавлении клиента только дополняется, перед append создаётся timestamp-backup;
-    - rollback, который копировал backup поверх server.conf, отключён;
-    - source/cache/DKMS каталоги создаются в новых путях, старые каталоги не удаляются;
-    - awg-tools устанавливаются в новый отдельный каталог TOOLS_INSTALL_ROOT, старые awg/awg-quick бинарники не перезаписываются;
-    - systemd unit получает PATH к каталогу выбранного awg-quick, но существующий unit не перезаписывается.
+   Исправлено тестами:
+   - bash -n всех скриптов;
+   - fake install;
+   - создание awg0/awg1;
+   - nftables template;
+   - обновление существующего native nftables без дублей;
+   - IPv4-only клиент по умолчанию;
+   - явный IPv6-клиент;
+   - update install.env с backup;
+   - 00_manage --status;
+   - удаление клиента и restore;
+   - удаление интерфейса, очистка nftables и restore.
 
-Что осталось осознанным ограничением
-------------------------------------
+Файлы, которые были изменены/добавлены
+--------------------------------------
 
-1. Автоматическая выдача клиентских IPv4 рассчитана на /24.
-   Поэтому 02_create_server_config.sh валидирует IPv4 адрес сервера как X.Y.Z.1/24.
+Изменены:
+- scripts/00_common.sh
+- scripts/00_manage.sh
+- scripts/02_create_server_config.sh
+- scripts/03_setup_nftables.sh
+- scripts/04_add_client.sh
+- scripts/05_update_amneziawg.sh
+- tests/run_tests.sh
+- README.txt
+- scripts/README.txt
+- docs/CONFIG_GUIDE.txt
+- docs/TROUBLESHOOTING.txt
 
-2. Автообновление nftables рассчитано на понятный native формат: table inet filter с chain input и table inet nat с chain postrouting.
-   Если firewall построен нестандартно или input policy не drop, скрипт остановится и покажет ручные инструкции вместо рискованного изменения.
+Добавлены:
+- scripts/08_remove_client.sh
+- scripts/09_remove_interface.sh
+- scripts/10_restore_backup.sh
+- docs/NOT_DONE_RU.txt
 
-3. Реальная сборка DKMS зависит от ядра, headers, Secure Boot и дистрибутива.
-   В контейнерных тестах это проверяется только заглушками.
+Ограничения
+-----------
+
+1. Реальное поднятие интерфейса на вашем VPS не выполнялось в контейнере: нет вашего ядра, systemd runtime, DKMS окружения и реального amneziawg kernel module.
+
+2. Автовыдача IPv4 рассчитана на /24.
+
+3. Автоматическое редактирование nftables рассчитано на понятный native ruleset. Для сложного firewall скрипт остановится и покажет ручные инструкции.

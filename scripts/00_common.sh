@@ -96,12 +96,28 @@ create_timestamped_backup_dir() {
     local label="${1:-backup}"
     local root="${BACKUP_ROOT:-${STATE_DIR}/backups}"
     local stamp dir i
+    if [[ -n "${FORCE_BACKUP_DIR:-}" ]]; then
+        dir="$FORCE_BACKUP_DIR"
+        mkdir -p "$dir"
+        chmod 700 "$dir" 2>/dev/null || true
+        [[ -f "${dir}/INFO" ]] || printf 'label=%s
+created_at=%s
+' "$label" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${dir}/INFO"
+        [[ -f "${dir}/MANIFEST.tsv" ]] || : > "${dir}/MANIFEST.tsv"
+        chmod 600 "${dir}/INFO" "${dir}/MANIFEST.tsv" 2>/dev/null || true
+        printf '%s
+' "$dir"
+        return 0
+    fi
     stamp="$(timestamp_for_backup)"
     label="$(printf '%s' "$label" | tr -c 'A-Za-z0-9_.-' '_')"
     dir="${root}/${stamp}-${label}"
     if [[ ! -e "$dir" ]]; then
         mkdir -p "$dir"
         chmod 700 "$dir" 2>/dev/null || true
+        printf 'label=%s\ncreated_at=%s\n' "$label" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${dir}/INFO"
+        : > "${dir}/MANIFEST.tsv"
+        chmod 600 "${dir}/INFO" "${dir}/MANIFEST.tsv" 2>/dev/null || true
         printf '%s\n' "$dir"
         return 0
     fi
@@ -110,6 +126,9 @@ create_timestamped_backup_dir() {
         if [[ ! -e "$dir" ]]; then
             mkdir -p "$dir"
             chmod 700 "$dir" 2>/dev/null || true
+            printf 'label=%s\ncreated_at=%s\n' "$label" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${dir}/INFO"
+            : > "${dir}/MANIFEST.tsv"
+            chmod 600 "${dir}/INFO" "${dir}/MANIFEST.tsv" 2>/dev/null || true
             printf '%s\n' "$dir"
             return 0
         fi
@@ -117,18 +136,30 @@ create_timestamped_backup_dir() {
     die "Не удалось создать backup directory в ${root}"
 }
 
-backup_file_to_dir() {
-    local file="$1"
+backup_path_to_dir() {
+    local path="$1"
     local dir="$2"
-    local target
-    [[ -e "$file" ]] || return 0
+    local rel target kind
+    [[ -e "$path" ]] || return 0
     ensure_dir "$dir"
-    target="${dir}/$(basename "$file")"
+    rel="${path#/}"
+    target="${dir}/files/${rel}"
     if [[ -e "$target" ]]; then
         target="$(next_available_path "$target")"
     fi
-    cp -a -- "$file" "$target"
+    ensure_dir "$(dirname "$target")"
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        kind="dir"
+    else
+        kind="file"
+    fi
+    cp -a -- "$path" "$target"
+    printf '%s\t%s\t%s\n' "$kind" "$path" "${target#${dir}/}" >> "${dir}/MANIFEST.tsv"
     printf '%s\n' "$target"
+}
+
+backup_file_to_dir() {
+    backup_path_to_dir "$@"
 }
 
 backup_file() {
@@ -140,9 +171,96 @@ backup_file() {
     if [[ -e "$file" ]]; then
         local dir backup
         dir="$(create_timestamped_backup_dir "$label")"
-        backup="$(backup_file_to_dir "$file" "$dir")"
+        backup="$(backup_path_to_dir "$file" "$dir")"
         printf '%s\n' "$backup"
     fi
+}
+
+restore_backup_dir() {
+    local dir="$1"
+    local manifest="${dir}/MANIFEST.tsv"
+    local kind original rel backup_path tmp_list
+    [[ -d "$dir" ]] || die "Backup directory не найден: $dir"
+    [[ -f "$manifest" ]] || die "В backup нет MANIFEST.tsv: $manifest"
+    tmp_list="$(mktemp)"
+    tac "$manifest" > "$tmp_list"
+    while IFS=$'\t' read -r kind original rel; do
+        [[ -n "${kind:-}" && -n "${original:-}" && -n "${rel:-}" ]] || continue
+        backup_path="${dir}/${rel}"
+        [[ -e "$backup_path" ]] || { warn "В backup не найден объект: $backup_path"; continue; }
+        ensure_dir "$(dirname "$original")"
+        rm -rf -- "$original"
+        cp -a -- "$backup_path" "$original"
+    done < "$tmp_list"
+    rm -f "$tmp_list"
+}
+
+replace_file_from_stdin() {
+    local file="$1"
+    local mode="${2:-600}"
+    local backup_dir="${3:-}"
+    local tmp
+    ensure_dir "$(dirname "$file")"
+    tmp="$(mktemp "${file}.tmp.XXXXXX")"
+    cat > "$tmp"
+    chmod "$mode" "$tmp"
+    if [[ -e "$file" && -n "$backup_dir" ]]; then
+        backup_path_to_dir "$file" "$backup_dir" >/dev/null
+    fi
+    mv -f -- "$tmp" "$file"
+}
+
+# Transaction helpers for scripts that create several files and may be interrupted.
+declare -ag AWG_CREATED_PATHS=()
+AWG_ACTIVE_BACKUP_DIR=""
+AWG_OPERATION_COMMITTED="yes"
+
+begin_safe_operation() {
+    local label="${1:-operation}"
+    AWG_ACTIVE_BACKUP_DIR="$(create_timestamped_backup_dir "$label")"
+    AWG_CREATED_PATHS=()
+    AWG_OPERATION_COMMITTED="no"
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'rollback_safe_operation "$?"' EXIT
+    printf '%s\n' "$AWG_ACTIVE_BACKUP_DIR"
+}
+
+track_created_path() {
+    local path="$1"
+    AWG_CREATED_PATHS+=("$path")
+    if [[ -n "${AWG_ACTIVE_BACKUP_DIR:-}" ]]; then
+        printf '%s
+' "$path" >> "${AWG_ACTIVE_BACKUP_DIR}/CREATED_PATHS"
+        chmod 600 "${AWG_ACTIVE_BACKUP_DIR}/CREATED_PATHS" 2>/dev/null || true
+    fi
+}
+
+operation_backup_path() {
+    local path="$1"
+    [[ -n "${AWG_ACTIVE_BACKUP_DIR:-}" ]] || die "operation_backup_path вызван без begin_safe_operation"
+    backup_path_to_dir "$path" "$AWG_ACTIVE_BACKUP_DIR"
+}
+
+commit_safe_operation() {
+    AWG_OPERATION_COMMITTED="yes"
+    trap - EXIT INT TERM
+}
+
+rollback_safe_operation() {
+    local code="${1:-1}"
+    local i path
+    if [[ "${AWG_OPERATION_COMMITTED:-yes}" == "yes" || "$code" == "0" ]]; then
+        return 0
+    fi
+    warn "Операция прервана/завершилась ошибкой. Выполняю откат созданных файлов. Backup: ${AWG_ACTIVE_BACKUP_DIR:-нет}"
+    if [[ -n "${AWG_ACTIVE_BACKUP_DIR:-}" && -f "${AWG_ACTIVE_BACKUP_DIR}/MANIFEST.tsv" ]]; then
+        restore_backup_dir "$AWG_ACTIVE_BACKUP_DIR" || true
+    fi
+    for (( i=${#AWG_CREATED_PATHS[@]}-1; i>=0; i-- )); do
+        path="${AWG_CREATED_PATHS[$i]}"
+        [[ -n "$path" ]] && rm -rf -- "$path" 2>/dev/null || true
+    done
 }
 
 prompt_default() {
@@ -240,7 +358,11 @@ write_install_state() {
     local awg_quick_bin="$3"
     local kmod_cache="$4"
     local tools_cache="$5"
-    cat <<EOF_STATE | append_or_create_file_from_stdin "$file" 600
+    local backup_dir="${AWG_ACTIVE_BACKUP_DIR:-}"
+    if [[ -z "$backup_dir" && -e "$file" ]]; then
+        backup_dir="$(create_timestamped_backup_dir install-env)"
+    fi
+    cat <<EOF_STATE | replace_file_from_stdin "$file" 600 "$backup_dir"
 # Generated by 01_install_from_source.sh
 STATE_DIR='${STATE_DIR}'
 CACHE_DIR='${CACHE_DIR}'
@@ -270,7 +392,12 @@ write_manager_env() {
     local external_if="${12:-}"
     local ssh_port="${13:-22}"
     local default_client_mtu="${14:-1280}"
-    cat <<EOF_MANAGER | append_or_create_file_from_stdin "$file" 600
+    local server_enable_ipv6="${15:-yes}"
+    local backup_dir="${AWG_ACTIVE_BACKUP_DIR:-}"
+    if [[ -z "$backup_dir" && -e "$file" ]]; then
+        backup_dir="$(create_timestamped_backup_dir manager-env-$(basename "$file"))"
+    fi
+    cat <<EOF_MANAGER | replace_file_from_stdin "$file" 600 "$backup_dir"
 # Generated by bundle scripts.
 STATE_DIR='${STATE_DIR}'
 SERVER_CONF='${server_conf}'
@@ -286,6 +413,7 @@ DNS_SERVERS='${dns_servers}'
 EXTERNAL_IF='${external_if}'
 SSH_PORT='${ssh_port}'
 DEFAULT_CLIENT_MTU='${default_client_mtu}'
+SERVER_ENABLE_IPV6='${server_enable_ipv6}'
 SYSCTL_FILE='${SYSCTL_FILE}'
 NFTABLES_CONF='${NFTABLES_CONF}'
 FIREWALL_ENV_FILE='${FIREWALL_ENV_FILE}'
@@ -296,11 +424,19 @@ write_firewall_env() {
     local file="$1"
     local external_if="$2"
     local ssh_port="$3"
-    cat <<EOF_FW | append_or_create_file_from_stdin "$file" 600
+    local awg_ports="${4:-}"
+    local awg_ifaces="${5:-}"
+    local backup_dir="${AWG_ACTIVE_BACKUP_DIR:-}"
+    if [[ -z "$backup_dir" && -e "$file" ]]; then
+        backup_dir="$(create_timestamped_backup_dir firewall-env)"
+    fi
+    cat <<EOF_FW | replace_file_from_stdin "$file" 600 "$backup_dir"
 # Generated by 03_setup_nftables.sh
 EXTERNAL_IF='${external_if}'
 SSH_PORT='${ssh_port}'
 NFTABLES_CONF='${NFTABLES_CONF}'
+AWG_PORTS='${awg_ports}'
+AWG_IFACES='${awg_ifaces}'
 EOF_FW
 }
 
@@ -371,6 +507,87 @@ detect_default_interface() {
     fi
     printf '%s\n' "$iface"
 }
+
+
+detect_default_ipv4_source() {
+    local src
+    src="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/ src / {for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')"
+    if [[ -z "$src" ]]; then
+        src="$(hostname -I 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\./) {print $i; exit}}')"
+    fi
+    printf '%s\n' "$src"
+}
+
+next_ipv4_cidr_default() {
+    local used="" conf cidr ip third i
+    shopt -s nullglob
+    for conf in "$STATE_DIR"/*.conf; do
+        cidr="$(get_server_ipv4_cidr "$conf" 2>/dev/null || true)"
+        ip="${cidr%/*}"
+        if [[ "$ip" =~ ^10\.8\.([0-9]{1,3})\.1$ ]]; then
+            third="${BASH_REMATCH[1]}"
+            used="${used}"$'\n'"${third}"
+        fi
+    done
+    shopt -u nullglob
+    for i in $(seq 1 254); do
+        if ! grep -qx "$i" <<< "$used"; then
+            printf '10.8.%s.1/24\n' "$i"
+            return 0
+        fi
+    done
+    printf '10.8.1.1/24\n'
+}
+
+ipv4_cidr_third_octet() {
+    local cidr="$1" ip
+    ip="${cidr%/*}"
+    if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.([0-9]{1,3})\.[0-9]{1,3}$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+default_ipv6_cidr_for_ipv4() {
+    local ipv4_cidr="$1"
+    local idx third
+    idx="$(ipv4_cidr_third_octet "$ipv4_cidr" 2>/dev/null || printf '1')"
+    third="$(printf '%x' $((0x42 + idx - 1)))"
+    printf 'fd42:42:%s::1/64\n' "$third"
+}
+
+next_ipv6_cidr_default() {
+    local ipv4_cidr="${1:-}"
+    [[ -n "$ipv4_cidr" ]] || ipv4_cidr="$(next_ipv4_cidr_default)"
+    default_ipv6_cidr_for_ipv4 "$ipv4_cidr"
+}
+
+normalise_yes_no() {
+    local value="$1"
+    case "$value" in
+        yes|Y|y|1|true|True|TRUE|да|Да|ДА) printf 'yes\n' ;;
+        no|N|n|0|false|False|FALSE|нет|Нет|НЕТ) printf 'no\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_yes_no() {
+    normalise_yes_no "$1" >/dev/null || { warn "Введите yes/no"; return 1; }
+}
+
+server_conf_has_ipv6() {
+    local conf="$1"
+    [[ -n "$(get_server_ipv6_cidr "$conf" 2>/dev/null || true)" ]]
+}
+
+server_conf_ipv6_safe_for_mtu() {
+    local conf="$1"
+    local mtu
+    mtu="$(get_server_mtu "$conf" 2>/dev/null || true)"
+    [[ -z "$mtu" || ! "$mtu" =~ ^[0-9]+$ || "$mtu" -ge 1280 ]]
+}
+
 
 get_conf_value() {
     local conf="$1"
@@ -621,12 +838,12 @@ write_manager_env_for_iface() {
     local external_if="${12:-}"
     local ssh_port="${13:-22}"
     local default_client_mtu="${14:-1280}"
+    local server_enable_ipv6="${15:-yes}"
     local iface_env
     iface_env="$(manager_env_for_iface "$vpn_if")"
-    write_manager_env "$iface_env" "$vpn_if" "$server_conf" "$clients_dir" "$keys_dir" "$endpoint_host" "$endpoint_port" "$service_name" "$awg_bin" "$awg_quick_bin" "$dns_servers" "$external_if" "$ssh_port" "$default_client_mtu"
+    write_manager_env "$iface_env" "$vpn_if" "$server_conf" "$clients_dir" "$keys_dir" "$endpoint_host" "$endpoint_port" "$service_name" "$awg_bin" "$awg_quick_bin" "$dns_servers" "$external_if" "$ssh_port" "$default_client_mtu" "$server_enable_ipv6"
     # Backward-compatible pointer to the most recently configured interface.
-    # The pointer is append-only: older blocks remain intact and shell source uses the last assignments.
-    write_manager_env "$pointer_file" "$vpn_if" "$server_conf" "$clients_dir" "$keys_dir" "$endpoint_host" "$endpoint_port" "$service_name" "$awg_bin" "$awg_quick_bin" "$dns_servers" "$external_if" "$ssh_port" "$default_client_mtu"
+    write_manager_env "$pointer_file" "$vpn_if" "$server_conf" "$clients_dir" "$keys_dir" "$endpoint_host" "$endpoint_port" "$service_name" "$awg_bin" "$awg_quick_bin" "$dns_servers" "$external_if" "$ssh_port" "$default_client_mtu" "$server_enable_ipv6"
 }
 
 load_manager_env_for_iface() {
