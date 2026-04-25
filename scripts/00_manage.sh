@@ -18,8 +18,10 @@ usage() {
   sudo ./install.sh
 
 Режимы:
-  --status     только показать найденное состояние и выйти
-  --help       показать эту справку
+  --status              только показать найденное состояние и выйти
+  --monitoring          развернуть/обновить мониторинг Prometheus/Grafana
+  --monitoring-status   показать состояние мониторинга
+  --help                показать эту справку
 
 Что делает при обычном запуске:
   1. Сканирует awg/awg-quick, модуль, sysctl, nftables, /etc/amnezia/amneziawg/*.conf.
@@ -125,8 +127,33 @@ status_report() {
             printf '      service:     %s\n' "$(service_state "$service")"
         done < <(list_awg_interfaces_from_confs)
     fi
+    printf '\nМониторинг:\n'
+    printf '  wgexporter:  %s\n' "$(service_state wgexporter)"
+    printf '  prometheus:  %s\n' "$(service_state prometheus)"
+    printf '  grafana:     %s\n' "$(service_state grafana-server)"
+    printf '  dashboard:   %s\n' "$( [[ -f /var/lib/grafana/dashboards/awg-managed/awg-traffic-by-client-dashboard.json ]] && printf 'есть' || printf 'нет' )"
     printf '\n'
 }
+
+monitoring_status_report() {
+    printf '=== Состояние мониторинга AWG ===\n'
+    if [[ -f /etc/wgexporter/monitoring.env ]]; then
+        # shellcheck disable=SC1091
+        source /etc/wgexporter/monitoring.env
+        printf 'monitoring.env: есть\n'
+        printf 'WG_IFACES:      %s\n' "${WG_IFACES:-?}"
+        printf 'ports:          exporter=%s persistent=%s prometheus=%s grafana=%s\n' "${EXPORTER_PORT:-9586}" "${PERSISTENT_EXPORTER_PORT:-9587}" "${PROMETHEUS_PORT:-9090}" "${GRAFANA_PORT:-3000}"
+    else
+        printf 'monitoring.env: нет\n'
+    fi
+    printf 'wgexporter:     %s\n' "$(service_state wgexporter)"
+    printf 'persistent:     %s\n' "$(service_state awg-persistent-traffic)"
+    printf 'prometheus:     %s\n' "$(service_state prometheus)"
+    printf 'grafana:        %s\n' "$(service_state grafana-server)"
+    printf 'dashboard:      %s\n' "$( [[ -f /var/lib/grafana/dashboards/awg-managed/awg-traffic-by-client-dashboard.json ]] && printf 'есть' || printf 'нет' )"
+    printf '\n'
+}
+
 
 run_install_if_needed() {
     if has_awg_tools; then
@@ -194,6 +221,12 @@ update_flow() {
     "${SCRIPT_DIR}/05_update_amneziawg.sh"
 }
 
+
+setup_monitoring_flow() {
+    "${SCRIPT_DIR}/11_setup_monitoring.sh"
+}
+
+
 first_run_recommendation() {
     if ! has_awg_tools; then
         printf 'Рекомендация: выполнить полную установку, затем создать первый интерфейс.\n'
@@ -226,8 +259,10 @@ menu_loop() {
         printf '  7) Удалить клиента из интерфейса\n'
         printf '  8) Удалить интерфейс AWG\n'
         printf '  9) Восстановить состояние из backup\n'
+        printf '  10) Развернуть/обновить мониторинг Prometheus/Grafana для всех интерфейсов\n'
+        printf '  11) Показать состояние мониторинга\n'
         printf '  0) Выход\n'
-        choice="$(prompt_choice "Выбор" "4" "0 1 2 3 4 5 6 7 8 9")"
+        choice="$(prompt_choice "Выбор" "4" "0 1 2 3 4 5 6 7 8 9 10 11")"
         case "$choice" in
             1) status_report ;;
             2) "${SCRIPT_DIR}/01_install_from_source.sh" ;;
@@ -238,6 +273,8 @@ menu_loop() {
             7) remove_client_flow ;;
             8) remove_interface_flow ;;
             9) restore_backup_flow ;;
+            10) setup_monitoring_flow ;;
+            11) monitoring_status_report ;;
             0) return 0 ;;
         esac
     done
@@ -248,6 +285,8 @@ main() {
     case "${1:-}" in
         --help|-h) usage; exit 0 ;;
         --status) status_report; exit 0 ;;
+        --monitoring) setup_monitoring_flow; exit 0 ;;
+        --monitoring-status) monitoring_status_report; exit 0 ;;
     esac
 
     status_report

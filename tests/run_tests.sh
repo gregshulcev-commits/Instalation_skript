@@ -248,7 +248,7 @@ grep -q "AWG_QUICK_BIN='${SAFE_INSTALL_PREFIX}/libexec/amneziawg-bundle-tools/bi
 pass "01_install_from_source.sh ставит awg-tools в новый каталог и не меняет старые бинарники"
 
 step "Тест 02_create_server_config.sh для awg0"
-printf '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | run_in_env "${BUNDLE_ROOT}/scripts/02_create_server_config.sh"
+printf '%s\n' '' '' '' yes '' '' '' '' '' '' '' '' '' '' '' '' '' '' n | run_in_env "${BUNDLE_ROOT}/scripts/02_create_server_config.sh"
 SERVER_CONF="${STATE_DIR}/awg0.conf"
 [[ -f "$SERVER_CONF" ]] || fail "server.conf не создан"
 grep -q '^Address = 10.8.1.1/24$' "$SERVER_CONF" || fail "В server.conf нет IPv4 Address"
@@ -296,7 +296,7 @@ cmp -s "$SERVER_CONF" "$SERVER_BEFORE" || fail "server.conf awg0 изменил�
 pass "02_create_server_config.sh не перезаписывает существующий интерфейс даже при OVERWRITE_EXISTING_IFACE=yes"
 
 step "Тест создания второго интерфейса awg1"
-printf '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | \
+printf '%s\n' '' '' '' yes '' '' '' '' '' '' '' '' '' '' '' '' '' '' n | \
     VPN_IF_DEFAULT=awg1 LISTEN_PORT_DEFAULT=520 \
     SERVER_ADDR_V4_DEFAULT=10.8.2.1/24 \
     SERVER_ADDR_V6_DEFAULT=fd42:42:43::1/64 \
@@ -421,5 +421,109 @@ RESTORE_CONFIRM=yes RESTORE_APPLY_NFT=no RESTORE_RESTART_SERVICES=no run_in_env 
 [[ -f "$CLIENT_CONF_2" ]] || fail "restore не вернул клиента awg1"
 grep -q 'iifname { "awg0", "awg1" } oifname "ens3" masquerade' "$NFTABLES_CONF" || fail "restore не вернул NAT для awg1"
 pass "09_remove_interface.sh удаляет интерфейс и чистит firewall, а restore возвращает состояние"
+
+step "Тест monitoring add-on: синтаксис и static-safety"
+bash -n "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" </dev/null || fail "11_setup_monitoring.sh не проходит bash -n"
+bash -n "${BUNDLE_ROOT}/monitoring/src/check_awg_monitoring.sh" </dev/null || fail "check_awg_monitoring.sh не проходит bash -n"
+/usr/bin/python3 -m py_compile \
+    "${BUNDLE_ROOT}/monitoring/src/awg_exporter_sync_peers.py" \
+    "${BUNDLE_ROOT}/monitoring/src/awg_persistent_traffic_exporter.py" || fail "Python monitoring helpers не проходят py_compile"
+/usr/bin/python3 - <<PY_DASH
+import json
+from pathlib import Path
+path = Path('${BUNDLE_ROOT}') / 'monitoring/grafana/awg-traffic-by-client-dashboard.json'
+data = json.loads(path.read_text(encoding='utf-8'))
+assert data['uid'] == 'awg-traffic-by-client'
+assert data['title'] == 'AWG traffic by client'
+panels = data.get('panels') or []
+assert len(panels) == 1
+panel = panels[0]
+assert panel.get('type') == 'bargauge'
+assert panel.get('datasource', {}).get('uid') == 'awg-prometheus'
+expr = panel['targets'][0]['expr']
+assert 'sum by (friendly_name)' in expr
+assert 'awg_persistent_received_bytes_total' in expr
+assert 'awg_persistent_sent_bytes_total' in expr
+PY_DASH
+grep -q '/usr/local/bin/wg' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "monitoring installer должен использовать /usr/local/bin/wg wrapper"
+! grep -q 'cat >.*/usr/bin/wg' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "monitoring installer не должен перезаписывать /usr/bin/wg"
+grep -q 'isDefault: false' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Grafana datasource не должен становиться default"
+grep -q 'disableDeletion: true' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Grafana provider должен включать disableDeletion"
+grep -q 'allowUiUpdates: true' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Grafana provider должен включать allowUiUpdates"
+grep -q 'MANAGE_EXISTING_GRAFANA_INI' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Нет флага безопасного управления существующим grafana.ini"
+grep -q 'python3-yaml' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Нет зависимости python3-yaml для аккуратного patch Prometheus YAML"
+grep -q 'promtool check config' "${BUNDLE_ROOT}/scripts/11_setup_monitoring.sh" || fail "Prometheus config должен проверяться promtool при наличии"
+pass "monitoring add-on проходит syntax/static safety checks"
+
+step "Тест awg-exporter-sync-peers: sanitized metadata без секретов"
+SYNC_TMP="${TMP_ROOT}/sync-peers"
+mkdir -p "$SYNC_TMP"
+cat >"${SYNC_TMP}/sample_awg0.conf" <<'EOF_SYNC_CONF'
+[Interface]
+PrivateKey = SERVER_SECRET
+Address = 10.8.1.1/24
+
+# friendly_name = owner_phone
+[Peer]
+PublicKey = PUB_OWNER
+PresharedKey = PSK_SECRET
+AllowedIPs = 10.8.1.2/32
+
+[Peer]
+# friendly_name = tablet
+PublicKey = PUB_TABLET
+AllowedIPs = 10.8.1.3/32
+EOF_SYNC_CONF
+/usr/bin/python3 "${BUNDLE_ROOT}/monitoring/src/awg_exporter_sync_peers.py" \
+    --output "${SYNC_TMP}/peers.conf" \
+    --owner "$(id -u):$(id -g)" \
+    --mode 0640 \
+    --configs "${SYNC_TMP}/sample_awg0.conf" >/dev/null
+grep -q '# friendly_name = owner_phone' "${SYNC_TMP}/peers.conf" || fail "friendly_name перед [Peer] не сохранён"
+grep -q '# friendly_name = tablet' "${SYNC_TMP}/peers.conf" || fail "friendly_name внутри [Peer] не сохранён"
+grep -q '^PublicKey = PUB_OWNER$' "${SYNC_TMP}/peers.conf" || fail "PublicKey не попал в sanitized peers.conf"
+grep -q '^AllowedIPs = 10.8.1.2/32$' "${SYNC_TMP}/peers.conf" || fail "AllowedIPs не попал в sanitized peers.conf"
+! grep -q 'PrivateKey' "${SYNC_TMP}/peers.conf" || fail "PrivateKey попал в sanitized peers.conf"
+! grep -q 'PresharedKey' "${SYNC_TMP}/peers.conf" || fail "PresharedKey попал в sanitized peers.conf"
+pass "awg-exporter-sync-peers создаёт файл метаданных без PrivateKey/PresharedKey"
+
+step "Тест persistent traffic exporter: reset counters + fallback friendly_name"
+/usr/bin/python3 - <<PY_PERSIST
+import importlib.util
+from pathlib import Path
+module_path = Path('${BUNDLE_ROOT}') / 'monitoring/src/awg_persistent_traffic_exporter.py'
+spec = importlib.util.spec_from_file_location('persist', module_path)
+mod = importlib.util.module_from_spec(spec)
+import sys
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+state = mod.empty_state()
+text1 = '''wireguard_received_bytes_total{interface="awg0",public_key="KEY1",allowed_ips="10.8.1.2/32",friendly_name="phone"} 100\nwireguard_sent_bytes_total{interface="awg0",public_key="KEY1",allowed_ips="10.8.1.2/32",friendly_name="phone"} 50\n'''
+mod.update_state_with_samples(state, mod.parse_wireguard_samples(text1), now=1)
+assert state['totals']['rx|awg0|KEY1'] == 100
+assert state['totals']['tx|awg0|KEY1'] == 50
+text2 = '''wireguard_received_bytes_total{interface="awg0",public_key="KEY1",allowed_ips="10.8.1.2/32",friendly_name="phone"} 150\nwireguard_sent_bytes_total{interface="awg0",public_key="KEY1",allowed_ips="10.8.1.2/32",friendly_name="phone"} 70\n'''
+mod.update_state_with_samples(state, mod.parse_wireguard_samples(text2), now=2)
+assert state['totals']['rx|awg0|KEY1'] == 150
+assert state['totals']['tx|awg0|KEY1'] == 70
+text3 = '''wireguard_received_bytes_total{interface="awg0",public_key="KEY1",allowed_ips="10.8.1.2/32",friendly_name="phone"} 10\nwireguard_sent_bytes_total{interface="awg0",public_key="KEY1",allowed_ips="10.8.1.2/32",friendly_name="phone"} 5\n'''
+mod.update_state_with_samples(state, mod.parse_wireguard_samples(text3), now=3)
+assert state['totals']['rx|awg0|KEY1'] == 160
+assert state['totals']['tx|awg0|KEY1'] == 75
+text4 = 'wireguard_received_bytes_total{interface="awg1",public_key="KEY2",allowed_ips="10.8.2.2/32"} 12\n'
+mod.update_state_with_samples(state, mod.parse_wireguard_samples(text4), now=4)
+assert state['labels']['rx|awg1|KEY2']['friendly_name'] == '10.8.2.2/32'
+rendered = mod.render_metrics(state, scrape_success=True)
+assert 'awg_persistent_received_bytes_total' in rendered
+assert 'friendly_name="phone"' in rendered
+assert '160' in rendered and '75' in rendered
+PY_PERSIST
+pass "persistent traffic exporter корректно переживает reset raw counter и добавляет fallback friendly_name"
+
+step "Тест единого install.sh: monitoring options доступны"
+bash -n "${BUNDLE_ROOT}/install.sh" </dev/null || fail "install.sh не проходит bash -n"
+"${BUNDLE_ROOT}/install.sh" --help | grep -q -- '--monitoring' || fail "install.sh --help не показывает --monitoring"
+"${BUNDLE_ROOT}/install.sh" --help | grep -q -- '--monitoring-status' || fail "install.sh --help не показывает --monitoring-status"
+pass "install.sh/00_manage.sh содержит единый вход для мониторинга"
 
 printf '\nИТОГ: все автоматические тесты завершились успешно.\n' | tee -a "$REPORT_FILE"

@@ -226,3 +226,36 @@ nftables
 - Автовыдача IPv4 рассчитана на /24.
 - Реальная DKMS-сборка зависит от ядра VPS, headers, Secure Boot и systemd. В контейнере проверяются только безопасные dry-run сценарии с заглушками.
 - Если nftables.conf имеет нестандартную структуру, скрипт остановится и напечатает ручные инструкции вместо рискованного изменения.
+
+====================================================================
+Monitoring add-on, 2026-04-25
+====================================================================
+
+В bundle добавлен безопасный multi-interface мониторинг Prometheus/Grafana.
+
+Основной запуск:
+
+  sudo ./install.sh --monitoring
+
+Через меню:
+
+  sudo ./install.sh
+  пункт 10 - развернуть/обновить мониторинг
+  пункт 11 - показать состояние мониторинга
+
+Документация:
+
+  docs/MONITORING_RU.md
+  docs/MONITORING_AUDIT_RU.md
+
+Существующие AWG install/config/client scripts не менялись. Добавлен новый
+скрипт scripts/11_setup_monitoring.sh и пункт меню в scripts/00_manage.sh.
+
+Главное поведение:
+
+- мониторинг всех интерфейсов AWG;
+- отдельный Grafana datasource AWG Prometheus, isDefault=false;
+- отдельный dashboard UID awg-traffic-by-client;
+- пользовательские dashboards не удаляются;
+- persistent traffic totals хранятся в /var/lib/wgexporter/traffic_totals.json;
+- /usr/bin/wg не перезаписывается, wrapper ставится в /usr/local/bin/wg.

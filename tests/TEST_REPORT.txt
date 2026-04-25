@@ -1,5 +1,5 @@
 AmneziaWG bundle test report
-Generated: 2026-04-25 08:56:49 UTC
+Generated: 2026-04-25 11:06:53 UTC
 
 == Подготовка окружения ==
 [PASS] Подготовлены fake sources и заглушки
@@ -48,5 +48,17 @@ Generated: 2026-04-25 08:56:49 UTC
 
 == Тест удаления интерфейса awg1 с очисткой nftables и restore backup ==
 [PASS] 09_remove_interface.sh удаляет интерфейс и чистит firewall, а restore возвращает состояние
+
+== Тест monitoring add-on: синтаксис и static-safety ==
+[PASS] monitoring add-on проходит syntax/static safety checks
+
+== Тест awg-exporter-sync-peers: sanitized metadata без секретов ==
+[PASS] awg-exporter-sync-peers создаёт файл метаданных без PrivateKey/PresharedKey
+
+== Тест persistent traffic exporter: reset counters + fallback friendly_name ==
+[PASS] persistent traffic exporter корректно переживает reset raw counter и добавляет fallback friendly_name
+
+== Тест единого install.sh: monitoring options доступны ==
+[PASS] install.sh/00_manage.sh содержит единый вход для мониторинга
 
 ИТОГ: все автоматические тесты завершились успешно.
