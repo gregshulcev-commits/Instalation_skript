@@ -101,6 +101,12 @@ AmneziaWG bash bundle
 
   sudo ./scripts/04_add_client.sh phone awg0
 
+По умолчанию новый peer применяется без полного restart интерфейса:
+
+  awg set <iface> peer <PublicKey> preshared-key <tmpfile> allowed-ips <AllowedIPs>
+
+Это безопаснее для рабочих серверов: добавление клиента не должно падать из-за старой unrelated-проблемы в awg-quick restart. Если нужен прежний режим, используйте CLIENT_APPLY_MODE=restart.
+
 По умолчанию клиент IPv4-only:
 
   [Interface]
@@ -130,14 +136,32 @@ AmneziaWG bash bundle
 Удаление клиента
 ----------------
 
-  sudo ./scripts/08_remove_client.sh phone awg0
+Рекомендуемый режим — выбор по номеру:
+
+  sudo ./scripts/08_remove_client.sh --interactive
+
+Или через меню:
+
+  sudo ./install.sh
+  # 7) Удалить клиента из интерфейса
 
 Что делает:
 - создаёт backup server.conf и client.conf;
-- удаляет peer block с `# friendly_name=phone` или legacy `### Client phone`;
-- удаляет файл clients/phone.conf;
-- перезапускает только awg-quick@awg0.service;
-- при ошибке restart по умолчанию откатывает изменения.
+- показывает интерфейсы и клиентов по номерам;
+- удаляет выбранный peer по PublicKey, поэтому одинаковые friendly_name на разных интерфейсах не мешают;
+- удаляет файл clients/<name>.conf, если он найден;
+- по умолчанию НЕ делает полный restart awg-quick@<iface>.service;
+- применяет удаление live-командой `awg set <iface> peer <PublicKey> remove`;
+- чистит persistent-счётчик удалённого peer из /var/lib/wgexporter/traffic_totals.json;
+- best-effort перезапускает wgexporter и awg-persistent-traffic, чтобы Grafana/Prometheus быстрее увидели изменение.
+
+Старый режим по имени оставлен для совместимости:
+
+  sudo ./scripts/08_remove_client.sh phone awg0
+
+Если по какой-то причине нужен старый полный restart интерфейса:
+
+  sudo CLIENT_APPLY_MODE=restart ./scripts/08_remove_client.sh --interactive
 
 Удаление интерфейса
 -------------------

@@ -1,5 +1,5 @@
 AmneziaWG bundle test report
-Generated: 2026-04-25 19:36:11 UTC
+Generated: 2026-04-25 20:16:41 UTC
 
 == Подготовка окружения ==
 [PASS] Подготовлены fake sources и заглушки
@@ -32,7 +32,7 @@ Generated: 2026-04-25 19:36:11 UTC
 [PASS] 03_setup_nftables.sh обновляет существующий firewall без дублей и сохраняет redirect
 
 == Тест добавления клиента на awg1 ==
-[PASS] 04_add_client.sh добавляет клиента в выбранный интерфейс
+[PASS] 04_add_client.sh добавляет клиента в выбранный интерфейс без полного restart awg-quick и обновляет мониторинг
 
 == Тест 05_update_amneziawg.sh атомарно перезаписывает install.env с backup ==
 [PASS] 05_update_amneziawg.sh выполняется на заглушках, перезаписывает install.env и сохраняет backup
@@ -47,7 +47,7 @@ Generated: 2026-04-25 19:36:11 UTC
 [PASS] 04_add_client.sh добавляет IPv6 /128 только при явном CLIENT_ENABLE_IPV6=yes
 
 == Тест удаления клиента и restore remove-client backup ==
-[PASS] 08_remove_client.sh удаляет клиента, а 10_restore_backup.sh возвращает его из backup
+[PASS] 08_remove_client.sh удаляет клиента без полного restart awg-quick, обновляет мониторинг, а restore возвращает backup
 
 == Тест удаления интерфейса awg1 с очисткой nftables и restore backup ==
 [PASS] 09_remove_interface.sh удаляет интерфейс и чистит firewall, а restore возвращает состояние

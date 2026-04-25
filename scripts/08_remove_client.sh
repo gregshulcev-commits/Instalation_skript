@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/00_common.sh"
 
 ROLLBACK_ON_RESTART_FAIL="${ROLLBACK_ON_RESTART_FAIL:-yes}"
+CLIENT_APPLY_MODE="${CLIENT_APPLY_MODE:-live}"
 
 usage() {
     cat <<'EOF_USAGE'
@@ -23,7 +24,8 @@ usage() {
   - файл client.conf из папки clients интерфейса, если имя клиента известно.
 
 Переменные:
-  ROLLBACK_ON_RESTART_FAIL=yes|no  - откатить удаление, если restart awg-quick@iface не удался. По умолчанию yes.
+  CLIENT_APPLY_MODE=live|restart|none - как применять удаление. По умолчанию live: awg set peer remove без полного restart интерфейса.
+  ROLLBACK_ON_RESTART_FAIL=yes|no  - откатить удаление, если применение/restart не удалось. По умолчанию yes.
 EOF_USAGE
 }
 
@@ -98,7 +100,8 @@ PY
 
 main() {
     local selector_mode selector_value requested_if selected_if vpn_if server_conf clients_dir service_name client_name public_key allowed_ips selected_line idx
-    local client_conf_file backup_dir removed_count restart_ok arg1
+    local client_conf_file backup_dir removed_count apply_ok apply_mode arg1 awg_bin key
+    local -a public_keys_to_remove=()
 
     require_root
     ensure_startup_full_backup "script-start-remove-client"
@@ -128,6 +131,7 @@ main() {
     server_conf="${SERVER_CONF:-$(server_conf_for_iface "$vpn_if")}"
     clients_dir="${CLIENTS_DIR:-$(clients_dir_for_iface "$vpn_if")}"
     service_name="${SERVICE_NAME:-awg-quick@${vpn_if}.service}"
+    awg_bin="${AWG_BIN:-$(detect_awg_bin)}"
 
     [[ -f "$server_conf" ]] || die "Не найден server.conf: $server_conf"
 
@@ -136,17 +140,20 @@ main() {
     allowed_ips=""
     if [[ "$selector_mode" == "interactive" ]]; then
         selected_line="$(select_client_interactive "$vpn_if")"
-        IFS=$'\t' read -r idx client_name public_key allowed_ips <<<"$selected_line"
+        IFS=$'	' read -r idx client_name public_key allowed_ips <<<"$selected_line"
         [[ -n "$public_key" ]] || die "У выбранного клиента нет PublicKey в ${server_conf}; удаление по номеру небезопасно"
         selector_mode="public_key"
         selector_value="$public_key"
+        public_keys_to_remove=("$public_key")
         ok "Выбран клиент #${idx}: ${client_name} (${allowed_ips:-без AllowedIPs})"
     elif [[ "$selector_mode" == "name" ]]; then
         client_name="$selector_value"
         client_exists_in_conf "$server_conf" "$client_name" || die "Клиент ${client_name} не найден в ${server_conf}"
+        mapfile -t public_keys_to_remove < <(list_clients_for_iface_tsv "$vpn_if" | awk -F '	' -v name="$client_name" '$2 == name && $3 != "" {print $3}')
     else
         public_key="$selector_value"
-        client_name="$(list_clients_for_iface_tsv "$vpn_if" | awk -F '\t' -v key="$public_key" '$3 == key {print $2; exit}')"
+        public_keys_to_remove=("$public_key")
+        client_name="$(list_clients_for_iface_tsv "$vpn_if" | awk -F '	' -v key="$public_key" '$3 == key {print $2; exit}')"
         [[ -n "$client_name" ]] || client_name="unknown-public-key"
     fi
 
@@ -164,29 +171,69 @@ main() {
     removed_count="$(remove_peer_from_server_conf "$server_conf" "$selector_mode" "$selector_value")"
     [[ -n "$client_conf_file" ]] && rm -f -- "$client_conf_file"
 
-    restart_ok="yes"
-    if command -v systemctl >/dev/null 2>&1; then
-        if ! systemctl restart "$service_name"; then
-            restart_ok="no"
-            warn "Не удалось перезапустить ${service_name}."
-            if [[ "$(normalise_yes_no "$ROLLBACK_ON_RESTART_FAIL" 2>/dev/null || printf yes)" == "yes" ]]; then
+    apply_ok="yes"
+    apply_mode="${CLIENT_APPLY_MODE:-live}"
+    case "$apply_mode" in
+        live)
+            if [[ -z "$awg_bin" ]]; then
+                apply_ok="no"
+                warn "Не найден awg; не могу применить live-удаление peer"
+            elif (( ${#public_keys_to_remove[@]} == 0 )); then
+                warn "Для выбранного клиента не найден PublicKey; удалён только файл server.conf/client.conf, live-интерфейс не менялся"
+            else
+                for key in "${public_keys_to_remove[@]}"; do
+                    if awg_set_peer_remove_live "$awg_bin" "$vpn_if" "$key"; then
+                        ok "Live peer удалён из $vpn_if: ${key:0:16}..."
+                        prune_persistent_traffic_state_for_peer "$vpn_if" "$key" || true
+                    else
+                        apply_ok="no"
+                        warn "Не удалось удалить peer live через awg set для ${vpn_if}: ${key:0:16}..."
+                        break
+                    fi
+                done
+            fi
+            if [[ "$apply_ok" != "yes" && "$(normalise_yes_no "$ROLLBACK_ON_RESTART_FAIL" 2>/dev/null || printf yes)" == "yes" ]]; then
                 rollback_safe_operation 1
                 AWG_OPERATION_COMMITTED="yes"
                 trap - EXIT INT TERM
-                systemctl restart "$service_name" >/dev/null 2>&1 || true
                 die "Удаление клиента ${client_name:-$selector_value} откачено из backup: $backup_dir"
             fi
-        fi
-    else
-        warn "systemctl не найден; restart ${service_name} пропущен"
-    fi
+            ;;
+        restart)
+            if command -v systemctl >/dev/null 2>&1; then
+                if ! systemctl restart "$service_name"; then
+                    apply_ok="no"
+                    warn "Не удалось перезапустить ${service_name}."
+                    if [[ "$(normalise_yes_no "$ROLLBACK_ON_RESTART_FAIL" 2>/dev/null || printf yes)" == "yes" ]]; then
+                        rollback_safe_operation 1
+                        AWG_OPERATION_COMMITTED="yes"
+                        trap - EXIT INT TERM
+                        systemctl restart "$service_name" >/dev/null 2>&1 || true
+                        die "Удаление клиента ${client_name:-$selector_value} откачено из backup: $backup_dir"
+                    fi
+                fi
+            else
+                warn "systemctl не найден; restart ${service_name} пропущен"
+            fi
+            ;;
+        none)
+            warn "CLIENT_APPLY_MODE=none: изменения сохранены только в файлах, live-интерфейс не менялся"
+            ;;
+        *)
+            rollback_safe_operation 1
+            AWG_OPERATION_COMMITTED="yes"
+            trap - EXIT INT TERM
+            die "Неизвестный CLIENT_APPLY_MODE=${apply_mode}; допустимо: live, restart, none"
+            ;;
+    esac
 
     commit_safe_operation
+    restart_monitoring_after_peer_change || true
     ok "Клиент удалён: ${client_name:-$selector_value}"
     ok "Интерфейс: ${vpn_if}"
     ok "Удалено peer-блоков: ${removed_count}"
     [[ -z "$client_conf_file" || ! -e "$client_conf_file" ]] && ok "Клиентский конфиг удалён/отсутствует: ${client_conf_file:-не определён}"
-    [[ "$restart_ok" == "yes" ]] && ok "Сервис перезапущен: ${service_name}"
+    [[ "$apply_ok" == "yes" ]] && ok "Изменение применено, режим: ${apply_mode}"
     ok "Backup папка операции: $backup_dir"
     ok "Full backup запуска: ${AWG_STARTUP_BACKUP_DIR:-создан ранее}"
     printf '\nДля полного ручного отката операции: sudo %s/10_restore_backup.sh %s\n' "$SCRIPT_DIR" "$backup_dir"

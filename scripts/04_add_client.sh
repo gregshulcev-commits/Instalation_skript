@@ -14,6 +14,7 @@ CLIENT_ENABLE_IPV6="${CLIENT_ENABLE_IPV6:-no}"
 PERSISTENT_KEEPALIVE="${PERSISTENT_KEEPALIVE:-25}"
 QR_OUTPUT="${QR_OUTPUT:-yes}"
 ROLLBACK_ON_RESTART_FAIL="${ROLLBACK_ON_RESTART_FAIL:-yes}"
+CLIENT_APPLY_MODE="${CLIENT_APPLY_MODE:-live}"
 
 usage() {
     cat <<'EOF_USAGE'
@@ -36,7 +37,8 @@ usage() {
   ENDPOINT_HOST_OVERRIDE=example   - endpoint host для client.conf
   ENDPOINT_PORT_OVERRIDE=443       - endpoint port для client.conf
   DNS_SERVERS_OVERRIDE='1.1.1.1'   - DNS для client.conf
-  ROLLBACK_ON_RESTART_FAIL=yes|no  - откат server.conf и client.conf, если systemctl restart не удался. По умолчанию yes.
+  CLIENT_APPLY_MODE=live|restart|none - как применять peer. По умолчанию live: awg set без полного restart интерфейса.
+  ROLLBACK_ON_RESTART_FAIL=yes|no  - откат server.conf и client.conf, если применение/restart не удалось. По умолчанию yes.
   QR_OUTPUT=no                     - не печатать QR-код
 EOF_USAGE
 }
@@ -109,7 +111,7 @@ main() {
     local client_name requested_if selected_if awg_bin server_conf clients_dir keys_dir vpn_if service_name endpoint_host endpoint_port endpoint
     local dns_servers server_ipv4_cidr server_ipv6_cidr server_ipv6_available client_ipv4 client_ipv6 obfs_block
     local client_privkey client_pubkey client_psk server_pubkey_file server_public_key server_private_key_file backup_dir
-    local client_conf_file host_id client_mtu enable_ipv6_raw enable_ipv6 server_allowed_ips client_allowed_ips restart_ok server_mtu
+    local client_conf_file host_id client_mtu enable_ipv6_raw enable_ipv6 server_allowed_ips client_allowed_ips apply_ok apply_mode server_mtu
 
     require_root
     source_env_if_exists "$INSTALL_STATE_FILE"
@@ -234,27 +236,54 @@ main() {
     generate_client_conf "$client_conf_file" "$client_privkey" "$client_ipv4" "$client_ipv6" "$dns_servers" "$client_mtu" "$obfs_block" "$server_public_key" "$client_psk" "$endpoint" "$client_allowed_ips" "$enable_ipv6" "$server_ipv6_available"
     append_peer_to_server_conf "$server_conf" "$client_name" "$client_pubkey" "$client_psk" "$server_allowed_ips"
 
-    restart_ok="yes"
-    if ! systemctl restart "$service_name"; then
-        restart_ok="no"
-        warn "Не удалось перезапустить ${service_name}. Проверьте: journalctl -u ${service_name} -n 100 --no-pager"
-        if [[ "$(normalise_yes_no "$ROLLBACK_ON_RESTART_FAIL" 2>/dev/null || printf yes)" == "yes" ]]; then
+    apply_ok="yes"
+    apply_mode="${CLIENT_APPLY_MODE:-live}"
+    case "$apply_mode" in
+        live)
+            if ! awg_set_peer_add_live "$awg_bin" "$vpn_if" "$client_pubkey" "$client_psk" "$server_allowed_ips"; then
+                apply_ok="no"
+                warn "Не удалось применить peer live через awg set для ${vpn_if}. Полный restart интерфейса не выполняю автоматически."
+                if [[ "$(normalise_yes_no "$ROLLBACK_ON_RESTART_FAIL" 2>/dev/null || printf yes)" == "yes" ]]; then
+                    rollback_safe_operation 1
+                    AWG_OPERATION_COMMITTED="yes"
+                    trap - EXIT INT TERM
+                    die "Изменения клиента ${client_name} откачены из backup: $backup_dir"
+                fi
+            fi
+            ;;
+        restart)
+            if ! systemctl restart "$service_name"; then
+                apply_ok="no"
+                warn "Не удалось перезапустить ${service_name}. Проверьте: journalctl -u ${service_name} -n 100 --no-pager -l"
+                if [[ "$(normalise_yes_no "$ROLLBACK_ON_RESTART_FAIL" 2>/dev/null || printf yes)" == "yes" ]]; then
+                    rollback_safe_operation 1
+                    AWG_OPERATION_COMMITTED="yes"
+                    trap - EXIT INT TERM
+                    systemctl restart "$service_name" >/dev/null 2>&1 || true
+                    die "Изменения клиента ${client_name} откачены из backup: $backup_dir"
+                fi
+            fi
+            ;;
+        none)
+            warn "CLIENT_APPLY_MODE=none: изменения сохранены только в файлах, live-интерфейс не менялся"
+            ;;
+        *)
             rollback_safe_operation 1
             AWG_OPERATION_COMMITTED="yes"
             trap - EXIT INT TERM
-            systemctl restart "$service_name" >/dev/null 2>&1 || true
-            die "Изменения клиента ${client_name} откачены из backup: $backup_dir"
-        fi
-    fi
+            die "Неизвестный CLIENT_APPLY_MODE=${apply_mode}; допустимо: live, restart, none"
+            ;;
+    esac
 
     commit_safe_operation
+    restart_monitoring_after_peer_change || true
     ok "Клиент добавлен: ${client_name}"
     ok "Интерфейс: ${vpn_if}"
     ok "Серверный конфиг дополнен: ${server_conf}"
     ok "Клиентский конфиг создан: ${client_conf_file}"
     ok "MTU клиента: ${client_mtu}"
     ok "AllowedIPs на сервере: ${server_allowed_ips}"
-    [[ "$restart_ok" == "yes" ]] && ok "Сервис перезапущен: ${service_name}"
+    [[ "$apply_ok" == "yes" ]] && ok "Изменение применено, режим: ${apply_mode}"
     ok "Backup папка операции: $backup_dir"
 
     if [[ "$QR_OUTPUT" == "yes" ]] && command -v qrencode >/dev/null 2>&1; then

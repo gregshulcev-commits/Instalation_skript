@@ -1145,6 +1145,151 @@ select_client_interactive() {
     done
 }
 
+
+service_unit_file_for_name() {
+    local svc="$1"
+    if [[ "$svc" != *.service ]]; then
+        svc="${svc}.service"
+    fi
+    printf '%s/%s\n' "$SYSTEMD_DIR" "$svc"
+}
+
+service_exists_or_known() {
+    local svc="$1"
+    [[ -f "$(service_unit_file_for_name "$svc")" ]] && return 0
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl status "$svc" >/dev/null 2>&1 && return 0
+    systemctl list-unit-files --no-legend "$svc" 2>/dev/null | grep -q . && return 0
+    return 1
+}
+
+try_restart_service_if_present() {
+    local svc="$1"
+    command -v systemctl >/dev/null 2>&1 || return 0
+    service_exists_or_known "$svc" || return 0
+    if systemctl restart "$svc" >/dev/null 2>&1; then
+        ok "Перезапущен сервис: $svc"
+    else
+        warn "Не удалось перезапустить $svc; проверьте: journalctl -u $svc -n 100 --no-pager -l"
+        return 1
+    fi
+}
+
+restart_monitoring_after_peer_change() {
+    # Best-effort: не откатывает AWG-операцию, если мониторинг не установлен или временно не стартует.
+    try_restart_service_if_present wgexporter || true
+    try_restart_service_if_present awg-persistent-traffic || true
+}
+
+awg_interface_exists() {
+    local iface="$1"
+    command -v ip >/dev/null 2>&1 || return 1
+    ip link show dev "$iface" >/dev/null 2>&1
+}
+
+normalise_allowed_ips_for_awg_set() {
+    printf '%s' "$1" | tr -d '[:space:]'
+}
+
+awg_set_peer_add_live() {
+    local awg_bin="$1"
+    local iface="$2"
+    local public_key="$3"
+    local psk="$4"
+    local allowed_ips="$5"
+    local tmp_psk allowed_compact
+    [[ -n "$awg_bin" && -x "$awg_bin" ]] || die "Не найден исполняемый awg для live apply"
+    [[ -n "$iface" && -n "$public_key" && -n "$psk" && -n "$allowed_ips" ]] || die "Недостаточно данных для live add peer"
+    if ! awg_interface_exists "$iface"; then
+        warn "Интерфейс $iface сейчас не поднят; live-добавление peer пропущено. Изменение уже сохранено в server.conf и применится при следующем запуске интерфейса."
+        return 0
+    fi
+    tmp_psk="$(mktemp)"
+    chmod 600 "$tmp_psk"
+    printf '%s\n' "$psk" > "$tmp_psk"
+    allowed_compact="$(normalise_allowed_ips_for_awg_set "$allowed_ips")"
+    if "$awg_bin" set "$iface" peer "$public_key" preshared-key "$tmp_psk" allowed-ips "$allowed_compact"; then
+        rm -f -- "$tmp_psk"
+        ok "Live peer добавлен в $iface через awg set без полного restart интерфейса"
+        return 0
+    fi
+    rm -f -- "$tmp_psk"
+    return 1
+}
+
+awg_set_peer_remove_live() {
+    local awg_bin="$1"
+    local iface="$2"
+    local public_key="$3"
+    [[ -n "$awg_bin" && -x "$awg_bin" ]] || die "Не найден исполняемый awg для live apply"
+    [[ -n "$iface" && -n "$public_key" ]] || die "Недостаточно данных для live remove peer"
+    if ! awg_interface_exists "$iface"; then
+        warn "Интерфейс $iface сейчас не поднят; live-удаление peer пропущено. Изменение уже сохранено в server.conf и применится при следующем запуске интерфейса."
+        return 0
+    fi
+    "$awg_bin" set "$iface" peer "$public_key" remove
+}
+
+prune_persistent_traffic_state_for_peer() {
+    local iface="$1"
+    local public_key="$2"
+    local state_file="${PERSISTENT_TRAFFIC_STATE_FILE:-/var/lib/wgexporter/traffic_totals.json}"
+    [[ -n "$public_key" ]] || return 0
+    [[ -f "$state_file" ]] || return 0
+    python3 -S - "$state_file" "$iface" "$public_key" <<'PY_PRUNE'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+iface = sys.argv[2]
+pub = sys.argv[3]
+try:
+    data = json.loads(path.read_text(encoding='utf-8'))
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+labels = data.get('labels') if isinstance(data.get('labels'), dict) else {}
+keys = set()
+for key, value in labels.items():
+    if not isinstance(value, dict):
+        continue
+    if value.get('public_key') == pub and (not iface or value.get('interface') == iface):
+        keys.add(key)
+if iface:
+    keys.add(f'rx|{iface}|{pub}')
+    keys.add(f'tx|{iface}|{pub}')
+else:
+    for key in list((data.get('totals') or {}).keys()):
+        if key.endswith('|' + pub):
+            keys.add(key)
+if not keys:
+    sys.exit(0)
+for store_name in ('last_raw', 'totals', 'labels', 'metrics'):
+    store = data.get(store_name)
+    if isinstance(store, dict):
+        for key in keys:
+            store.pop(key, None)
+fd, tmp = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=str(path.parent))
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, ensure_ascii=False, sort_keys=True, indent=2)
+        fh.write('\n')
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+finally:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+print(f'pruned {len(keys)} persistent keys for {iface}/{pub}')
+PY_PRUNE
+}
+
 strip_cr() {
     tr -d '\r'
 }
